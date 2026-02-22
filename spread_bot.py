@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Optional
 
 import requests
-import yfinance as yf
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
@@ -486,52 +485,94 @@ def broadcast(text: str, keyboard: Optional[dict] = None) -> None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Yahoo Finance price fetching via direct HTTP (no yfinance.info)
+# ---------------------------------------------------------------------------
+# We use Yahoo's v8 chart API instead of yfinance .info because:
+#   - .info makes heavy requests that get 429'd on shared Railway IPs
+#   - Chart API is lightweight, harder to rate-limit, returns same data
+#   - We rotate User-Agent headers to avoid fingerprinting
+# ---------------------------------------------------------------------------
+
+_YAHOO_HEADERS = [
+    {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+    {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"},
+    {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"},
+    {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0"},
+    {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/120.0"},
+]
+_header_idx = 0
+_header_lock = threading.Lock()
+
+def _next_headers() -> dict:
+    global _header_idx
+    with _header_lock:
+        h = _YAHOO_HEADERS[_header_idx % len(_YAHOO_HEADERS)]
+        _header_idx += 1
+        return h
+
+
 def parse_yahoo_snapshot(ticker: str) -> Optional[YahooSnapshot]:
     """
-    Fetch full Yahoo snapshot using .info.
+    Fetch Yahoo snapshot via direct HTTP to the v8 chart + quoteSummary APIs.
 
-    .info contains preMarketPrice and postMarketPrice which are NOT
-    available in fast_info. We need .info to get extended-hours prices.
-
-    Yahoo Finance shows TWO prices:
-      LEFT  = regularMarketPrice (at close)
-      RIGHT = postMarketPrice / preMarketPrice (extended hours)
-
-    We ALWAYS use the RIGHT price when it exists (non-zero).
+    Uses two endpoints:
+      1. v8/finance/chart   — gets regularMarketPrice fast, lightweight
+      2. v7/finance/quote   — gets preMarketPrice / postMarketPrice for extended hours
 
     Priority:
       1. preMarketPrice  -- pre-market session active (morning)
       2. postMarketPrice -- after-hours session active (evening)
       3. regularMarketPrice -- fallback when market open or fully closed
     """
+    import random, time as _time
+
     try:
-        info: dict = yf.Ticker(ticker).info
+        headers = _next_headers()
+
+        # ── Step 1: v7/finance/quote — has ALL prices in one call ───────────
+        url = (
+            f"https://query1.finance.yahoo.com/v7/finance/quote"
+            f"?symbols={ticker}&fields=regularMarketPrice,preMarketPrice,postMarketPrice"
+        )
+        resp = requests.get(url, headers=headers, timeout=10)
+
+        # If rate limited, try query2 with different header
+        if resp.status_code == 429:
+            _time.sleep(0.5 + random.random())
+            url2 = url.replace("query1", "query2")
+            resp = requests.get(url2, headers=_next_headers(), timeout=10)
+
+        resp.raise_for_status()
+        data = resp.json()
+
+        result_list = data.get("quoteResponse", {}).get("result", [])
+        if not result_list:
+            logger.warning("Yahoo %s: empty result from v7/quote", ticker)
+            return None
+
+        q = result_list[0]
 
         regular_price: Optional[float] = None
         pre_price:     Optional[float] = None
         post_price:    Optional[float] = None
 
-        # Regular close price (LEFT on Yahoo UI)
-        for key in ("regularMarketPrice", "currentPrice", "previousClose"):
-            try:
-                v = float(info.get(key) or 0)
-                if v > 0:
-                    regular_price = v
-                    break
-            except (TypeError, ValueError):
-                pass
-
-        # Pre-market price (RIGHT on Yahoo UI, morning before open)
         try:
-            v = float(info.get("preMarketPrice") or 0)
+            v = float(q.get("regularMarketPrice") or 0)
+            if v > 0:
+                regular_price = v
+        except (TypeError, ValueError):
+            pass
+
+        try:
+            v = float(q.get("preMarketPrice") or 0)
             if v > 0:
                 pre_price = v
         except (TypeError, ValueError):
             pass
 
-        # After-hours price (RIGHT on Yahoo UI, evening after close)
         try:
-            v = float(info.get("postMarketPrice") or 0)
+            v = float(q.get("postMarketPrice") or 0)
             if v > 0:
                 post_price = v
         except (TypeError, ValueError):
