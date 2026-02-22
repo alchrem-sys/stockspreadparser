@@ -486,20 +486,20 @@ def broadcast(text: str, keyboard: Optional[dict] = None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Yahoo Finance price fetching via direct HTTP (no yfinance.info)
+# Yahoo Finance — single batched request for all tickers
 # ---------------------------------------------------------------------------
-# We use Yahoo's v8 chart API instead of yfinance .info because:
-#   - .info makes heavy requests that get 429'd on shared Railway IPs
-#   - Chart API is lightweight, harder to rate-limit, returns same data
-#   - We rotate User-Agent headers to avoid fingerprinting
+# Instead of 48 individual requests (which get rate-limited/blocked on
+# shared IPs like Railway), we fetch ALL symbols in ONE request.
+# Yahoo's v7/finance/quote supports comma-separated symbols.
 # ---------------------------------------------------------------------------
 
 _YAHOO_HEADERS = [
-    {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
-    {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"},
-    {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"},
-    {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0"},
-    {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/120.0"},
+    {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+     "Accept": "application/json", "Accept-Language": "en-US,en;q=0.9"},
+    {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+     "Accept": "application/json", "Accept-Language": "en-US,en;q=0.9"},
+    {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0",
+     "Accept": "application/json", "Accept-Language": "en-US,en;q=0.9"},
 ]
 _header_idx = 0
 _header_lock = threading.Lock()
@@ -509,143 +509,135 @@ def _next_headers() -> dict:
     with _header_lock:
         h = _YAHOO_HEADERS[_header_idx % len(_YAHOO_HEADERS)]
         _header_idx += 1
-        return h
+        return dict(h)  # return a copy
+
+
+def _parse_quote(q: dict) -> Optional[YahooSnapshot]:
+    """Parse one quote dict from Yahoo batch response into a YahooSnapshot."""
+    ticker = q.get("symbol", "")
+
+    regular_price: Optional[float] = None
+    pre_price:     Optional[float] = None
+    post_price:    Optional[float] = None
+
+    try:
+        v = float(q.get("regularMarketPrice") or 0)
+        if v > 0:
+            regular_price = v
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        v = float(q.get("preMarketPrice") or 0)
+        if v > 0:
+            pre_price = v
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        v = float(q.get("postMarketPrice") or 0)
+        if v > 0:
+            post_price = v
+    except (TypeError, ValueError):
+        pass
+
+    if not regular_price:
+        return None
+
+    if pre_price:
+        active_state, active_price = MARKET_PRE,     pre_price
+    elif post_price:
+        active_state, active_price = MARKET_AFTER,   post_price
+    else:
+        active_state, active_price = MARKET_REGULAR, regular_price
+
+    return YahooSnapshot(
+        ticker=ticker,
+        active_price=active_price,
+        active_state=active_state,
+        regular_price=regular_price,
+        pre_price=pre_price,
+        post_price=post_price,
+    )
 
 
 def parse_yahoo_snapshot(ticker: str) -> Optional[YahooSnapshot]:
+    """Single-ticker fallback — not used in normal operation."""
+    snaps = fetch_all_yahoo_batch([ticker])
+    return snaps.get(ticker)
+
+
+def fetch_all_yahoo_batch(tickers: list[str]) -> dict[str, YahooSnapshot]:
     """
-    Fetch Yahoo snapshot via direct HTTP to the v8 chart + quoteSummary APIs.
+    Fetch all tickers in ONE batched HTTP request.
 
-    Uses two endpoints:
-      1. v8/finance/chart   — gets regularMarketPrice fast, lightweight
-      2. v7/finance/quote   — gets preMarketPrice / postMarketPrice for extended hours
-
-    Priority:
-      1. preMarketPrice  -- pre-market session active (morning)
-      2. postMarketPrice -- after-hours session active (evening)
-      3. regularMarketPrice -- fallback when market open or fully closed
+    Yahoo v7/finance/quote supports comma-separated symbols.
+    1 request instead of 48 = virtually zero chance of rate-limiting.
+    Falls back to splitting into chunks of 25 if the full batch fails.
     """
-    import random, time as _time
+    import time as _time
 
-    try:
+    def _do_batch(syms: list[str]) -> dict[str, YahooSnapshot]:
+        symbols_str = ",".join(syms)
+        fields = "regularMarketPrice,preMarketPrice,postMarketPrice"
+        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbols_str}&fields={fields}"
         headers = _next_headers()
+        resp = requests.get(url, headers=headers, timeout=15)
 
-        # ── Step 1: v7/finance/quote — has ALL prices in one call ───────────
-        url = (
-            f"https://query1.finance.yahoo.com/v7/finance/quote"
-            f"?symbols={ticker}&fields=regularMarketPrice,preMarketPrice,postMarketPrice"
-        )
-        resp = requests.get(url, headers=headers, timeout=10)
-
-        # If rate limited, try query2 with different header
-        if resp.status_code == 429:
-            _time.sleep(0.5 + random.random())
+        if resp.status_code in (401, 429):
+            # Try query2 with a different User-Agent
+            _time.sleep(1)
             url2 = url.replace("query1", "query2")
-            resp = requests.get(url2, headers=_next_headers(), timeout=10)
+            resp = requests.get(url2, headers=_next_headers(), timeout=15)
 
         resp.raise_for_status()
         data = resp.json()
+        quotes = data.get("quoteResponse", {}).get("result", [])
+        out = {}
+        for q in quotes:
+            snap = _parse_quote(q)
+            if snap:
+                out[snap.ticker] = snap
+        return out
 
-        result_list = data.get("quoteResponse", {}).get("result", [])
-        if not result_list:
-            logger.warning("Yahoo %s: empty result from v7/quote", ticker)
-            return None
+    result: dict[str, YahooSnapshot] = {}
 
-        q = result_list[0]
-
-        regular_price: Optional[float] = None
-        pre_price:     Optional[float] = None
-        post_price:    Optional[float] = None
-
-        try:
-            v = float(q.get("regularMarketPrice") or 0)
-            if v > 0:
-                regular_price = v
-        except (TypeError, ValueError):
-            pass
-
-        try:
-            v = float(q.get("preMarketPrice") or 0)
-            if v > 0:
-                pre_price = v
-        except (TypeError, ValueError):
-            pass
-
-        try:
-            v = float(q.get("postMarketPrice") or 0)
-            if v > 0:
-                post_price = v
-        except (TypeError, ValueError):
-            pass
-
-        if regular_price is None:
-            logger.warning("Yahoo %s: could not get regular price", ticker)
-            return None
-
-        # Always prefer extended hours price when available
-        if pre_price and pre_price > 0:
-            active_state = MARKET_PRE
-            active_price = pre_price
-        elif post_price and post_price > 0:
-            active_state = MARKET_AFTER
-            active_price = post_price
-        else:
-            active_state = MARKET_REGULAR
-            active_price = regular_price
-
-        logger.info(
-            "Yahoo %-6s | %-14s active=%8.4f  regular=%8.4f  pre=%s  post=%s",
-            ticker, active_state, active_price, regular_price,
-            f"{pre_price:.4f}" if pre_price else "--",
-            f"{post_price:.4f}" if post_price else "--",
-        )
-
-        return YahooSnapshot(
-            ticker=ticker,
-            active_price=active_price,
-            active_state=active_state,
-            regular_price=regular_price,
-            pre_price=pre_price,
-            post_price=post_price,
-        )
-
+    try:
+        # Try all tickers in one shot
+        result = _do_batch(tickers)
+        logger.info("Yahoo: got %d/%d tickers (batch)", len(result), len(tickers))
     except Exception as exc:
-        logger.error("Yahoo %s error: %s", ticker, exc)
-        return None
+        logger.warning("Yahoo batch failed (%s) — splitting into chunks", exc)
+        # Fall back: split into chunks of 20
+        chunk_size = 20
+        for i in range(0, len(tickers), chunk_size):
+            chunk = tickers[i:i + chunk_size]
+            try:
+                partial = _do_batch(chunk)
+                result.update(partial)
+                logger.info("Yahoo chunk %d-%d: got %d", i, i+len(chunk), len(partial))
+            except Exception as chunk_exc:
+                logger.error("Yahoo chunk %d failed: %s", i, chunk_exc)
+            _time.sleep(0.5)
+
+    # Log each ticker result
+    for ticker in tickers:
+        snap = result.get(ticker)
+        if snap:
+            logger.info(
+                "Yahoo %-6s | %-14s active=%8.4f  regular=%8.4f  pre=%s  post=%s",
+                ticker, snap.active_state, snap.active_price, snap.regular_price,
+                f"{snap.pre_price:.4f}" if snap.pre_price else "--",
+                f"{snap.post_price:.4f}" if snap.post_price else "--",
+            )
+        else:
+            logger.warning("Yahoo %-6s | no data", ticker)
+
+    return result
 
 
 def fetch_all_yahoo() -> dict[str, YahooSnapshot]:
-    """
-    Fetch all tickers in parallel using a thread pool.
-
-    WHY PARALLEL:
-    - .info makes one HTTP request per ticker (~1s each)
-    - Sequential = 48 tickers * 1s = 48s total -> Yahoo rate-limits after ~25
-    - Parallel with 10 workers = all 48 done in ~5s, no rate limiting
-
-    10 workers is the sweet spot: fast enough to get all tickers,
-    spread out enough that Yahoo doesn't block us.
-    """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    result:      dict[str, YahooSnapshot] = {}
-    result_lock = threading.Lock()
-
-    def _fetch_one(ticker: str) -> None:
-        snap = parse_yahoo_snapshot(ticker)
-        if snap:
-            with result_lock:
-                result[ticker] = snap
-
-    with ThreadPoolExecutor(max_workers=10) as pool:
-        futures = {pool.submit(_fetch_one, t): t for t in ALL_YAHOO_TICKERS}
-        for fut in as_completed(futures):
-            exc = fut.exception()
-            if exc:
-                logger.warning("Yahoo worker %s: %s", futures[fut], exc)
-
-    logger.info("Yahoo: got %d/%d tickers", len(result), len(ALL_YAHOO_TICKERS))
-    return result
+    return fetch_all_yahoo_batch(ALL_YAHOO_TICKERS)
 
 # ---------------------------------------------------------------------------
 # MEXC — bid1 / ask1 / fair price
