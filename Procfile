@@ -1,0 +1,1 @@
+worker: python3 spread_bot.py
