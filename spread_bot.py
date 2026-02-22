@@ -486,137 +486,191 @@ def broadcast(text: str, keyboard: Optional[dict] = None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Finnhub — price fetching (replaces Yahoo Finance)
+# Yahoo Finance — cookie/crumb authenticated requests
 # ---------------------------------------------------------------------------
-# Yahoo Finance blocks Railway IPs. Finnhub is free (60 req/min),
-# reliable, and supports pre/post market prices.
-#
-# Free API key: https://finnhub.io (sign up, copy key to .env)
-# Env var: FINNHUB_TOKEN=your_key_here
-#
-# Finnhub /quote returns:
-#   c  = current price (regular market)
-#   pc = previous close
-# Finnhub doesn't have pre/post market on free tier, but we can detect
-# extended hours by comparing current price to previous close + timestamp.
-#
-# For extended hours detection we use the marketStatus field from
-# Finnhub's market status endpoint, plus the quote timestamp.
+# Yahoo requires a cookie + crumb token for API access.
+# We fetch these once at startup and refresh on 401.
+# This works from Railway IPs because we authenticate like a browser.
 # ---------------------------------------------------------------------------
 
-FINNHUB_TOKEN: str = os.getenv("FINNHUB_TOKEN", "")
-FINNHUB_BASE  = "https://finnhub.io/api/v1"
+_yahoo_session  = requests.Session()
+_yahoo_crumb:   Optional[str] = None
+_yahoo_cookie:  Optional[str] = None
+_crumb_lock     = threading.Lock()
+
+_BROWSER_HEADERS = {
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection":      "keep-alive",
+}
 
 
-def _finnhub_get(path: str, params: dict) -> dict:
-    """Make a Finnhub API call. Raises on error."""
-    params["token"] = FINNHUB_TOKEN
-    resp = requests.get(f"{FINNHUB_BASE}{path}", params=params, timeout=10)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def _parse_finnhub_quote(ticker: str, data: dict) -> Optional[YahooSnapshot]:
+def _refresh_yahoo_crumb() -> bool:
     """
-    Parse Finnhub /quote response into YahooSnapshot.
-
-    Finnhub /quote fields:
-      c  = current price
-      pc = previous close
-      t  = timestamp of last trade
-
-    Extended hours detection:
-      Finnhub free tier doesn't give separate pre/post prices.
-      We detect market state by checking if the quote timestamp
-      falls outside regular NYSE hours (9:30-16:00 ET Mon-Fri).
+    Fetch a fresh Yahoo cookie + crumb.
+    Yahoo requires visiting the consent page first, then /v1/test/getcrumb.
+    Returns True on success.
     """
+    global _yahoo_crumb, _yahoo_cookie
     try:
-        price = float(data.get("c") or 0)
-        if price <= 0:
-            return None
-
-        # Determine market state from timestamp
-        import datetime, zoneinfo
-        ts = data.get("t", 0)
-        et = zoneinfo.ZoneInfo("America/New_York")
-        dt = datetime.datetime.fromtimestamp(ts, tz=et) if ts else datetime.datetime.now(tz=et)
-
-        market_open  = dt.replace(hour=9,  minute=30, second=0, microsecond=0)
-        market_close = dt.replace(hour=16, minute=0,  second=0, microsecond=0)
-        is_weekday   = dt.weekday() < 5  # Mon-Fri
-
-        if not is_weekday or dt >= market_close:
-            active_state = MARKET_AFTER
-        elif dt < market_open:
-            active_state = MARKET_PRE
-        else:
-            active_state = MARKET_REGULAR
-
-        # For after/pre hours, Finnhub `c` is already the extended price
-        # (it reflects the last trade regardless of session)
-        regular_price = float(data.get("pc") or price)  # use prev close as "regular"
-        if active_state == MARKET_REGULAR:
-            regular_price = price
-
-        logger.info(
-            "Finnhub %-6s | %-14s active=%8.4f",
-            ticker, active_state, price,
+        # Step 1: hit Yahoo Finance to get session cookie
+        r = _yahoo_session.get(
+            "https://finance.yahoo.com",
+            headers=_BROWSER_HEADERS,
+            timeout=10,
         )
+        # Step 2: accept consent if redirected to GDPR page
+        if "consent" in r.url:
+            _yahoo_session.post(
+                "https://consent.yahoo.com/v2/collectConsent",
+                data={"agree": ["agree"], "consentUUID": "default", "sessionId": "default"},
+                headers=_BROWSER_HEADERS,
+                timeout=10,
+            )
 
-        return YahooSnapshot(
-            ticker=ticker,
-            active_price=price,
-            active_state=active_state,
-            regular_price=regular_price,
-            pre_price=price  if active_state == MARKET_PRE   else None,
-            post_price=price if active_state == MARKET_AFTER else None,
+        # Step 3: get crumb token
+        r2 = _yahoo_session.get(
+            "https://query1.finance.yahoo.com/v1/test/getcrumb",
+            headers={**_BROWSER_HEADERS, "Accept": "text/plain"},
+            timeout=10,
         )
+        if r2.status_code == 200 and r2.text and len(r2.text) < 50:
+            _yahoo_crumb  = r2.text.strip()
+            _yahoo_cookie = "; ".join(f"{k}={v}" for k, v in _yahoo_session.cookies.items())
+            logger.info("Yahoo crumb refreshed OK (crumb=%s)", _yahoo_crumb[:8] + "...")
+            return True
+        logger.warning("Yahoo crumb fetch failed: status=%d body=%r", r2.status_code, r2.text[:100])
+        return False
     except Exception as exc:
-        logger.error("Finnhub parse %s: %s", ticker, exc)
+        logger.error("Yahoo crumb refresh error: %s", exc)
+        return False
+
+
+def _yahoo_quote_batch(tickers: list[str]) -> list[dict]:
+    """
+    Fetch quotes for multiple tickers in one Yahoo v7/finance/quote call.
+    Uses authenticated session with cookie+crumb.
+    Returns list of quote dicts.
+    """
+    global _yahoo_crumb
+    symbols = ",".join(tickers)
+    params  = {
+        "symbols": symbols,
+        "fields":  "regularMarketPrice,preMarketPrice,postMarketPrice,marketState",
+        "crumb":   _yahoo_crumb or "",
+    }
+    headers = {
+        **_BROWSER_HEADERS,
+        "Cookie": _yahoo_cookie or "",
+    }
+    resp = _yahoo_session.get(
+        "https://query1.finance.yahoo.com/v7/finance/quote",
+        params=params,
+        headers=headers,
+        timeout=15,
+    )
+    if resp.status_code in (401, 403):
+        return []  # caller should refresh crumb and retry
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("quoteResponse", {}).get("result", [])
+
+
+def _parse_quote(q: dict) -> Optional[YahooSnapshot]:
+    """Parse one Yahoo quote dict into YahooSnapshot."""
+    ticker = q.get("symbol", "")
+
+    regular_price: Optional[float] = None
+    pre_price:     Optional[float] = None
+    post_price:    Optional[float] = None
+
+    try:
+        v = float(q.get("regularMarketPrice") or 0)
+        if v > 0:
+            regular_price = v
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        v = float(q.get("preMarketPrice") or 0)
+        if v > 0:
+            pre_price = v
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        v = float(q.get("postMarketPrice") or 0)
+        if v > 0:
+            post_price = v
+    except (TypeError, ValueError):
+        pass
+
+    if not regular_price:
         return None
+
+    if pre_price:
+        active_state, active_price = MARKET_PRE,     pre_price
+    elif post_price:
+        active_state, active_price = MARKET_AFTER,   post_price
+    else:
+        active_state, active_price = MARKET_REGULAR, regular_price
+
+    return YahooSnapshot(
+        ticker=ticker,
+        active_price=active_price,
+        active_state=active_state,
+        regular_price=regular_price,
+        pre_price=pre_price,
+        post_price=post_price,
+    )
 
 
 def parse_yahoo_snapshot(ticker: str) -> Optional[YahooSnapshot]:
-    """Single-ticker fetch via Finnhub."""
-    try:
-        data = _finnhub_get("/quote", {"symbol": ticker})
-        return _parse_finnhub_quote(ticker, data)
-    except Exception as exc:
-        logger.error("Finnhub %s error: %s", ticker, exc)
-        return None
+    """Single-ticker fetch (fallback only)."""
+    results = _yahoo_quote_batch([ticker])
+    if results:
+        return _parse_quote(results[0])
+    return None
 
 
 def fetch_all_yahoo() -> dict[str, YahooSnapshot]:
     """
-    Fetch all tickers from Finnhub in parallel.
-    Free tier: 60 req/min — 48 tickers well within limit.
-    Uses 8 workers to stay safely under rate limit.
+    Fetch ALL tickers in one batched Yahoo request using cookie+crumb auth.
+    Refreshes crumb automatically on 401.
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    import time as _time
+    global _yahoo_crumb
 
-    if not FINNHUB_TOKEN:
-        logger.error("FINNHUB_TOKEN not set — cannot fetch prices")
-        return {}
+    with _crumb_lock:
+        if not _yahoo_crumb:
+            _refresh_yahoo_crumb()
 
-    result:      dict[str, YahooSnapshot] = {}
-    result_lock = threading.Lock()
+    # Try the full batch
+    quotes = _yahoo_quote_batch(ALL_YAHOO_TICKERS)
 
-    def _fetch_one(ticker: str) -> None:
-        snap = parse_yahoo_snapshot(ticker)
+    if not quotes:
+        # 401/403 — crumb expired, refresh and retry once
+        logger.warning("Yahoo auth failed — refreshing crumb")
+        with _crumb_lock:
+            _refresh_yahoo_crumb()
+        quotes = _yahoo_quote_batch(ALL_YAHOO_TICKERS)
+
+    result: dict[str, YahooSnapshot] = {}
+    for q in quotes:
+        snap = _parse_quote(q)
         if snap:
-            with result_lock:
-                result[ticker] = snap
+            result[snap.ticker] = snap
+            logger.info(
+                "Yahoo %-6s | %-14s active=%8.4f  regular=%8.4f  pre=%s  post=%s",
+                snap.ticker, snap.active_state, snap.active_price, snap.regular_price,
+                f"{snap.pre_price:.4f}"  if snap.pre_price  else "--",
+                f"{snap.post_price:.4f}" if snap.post_price else "--",
+            )
+        else:
+            logger.warning("Yahoo %-6s | no data", q.get("symbol", "?"))
 
-    # 8 workers, small delay between batches to stay under 60 req/min
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {pool.submit(_fetch_one, t): t for t in ALL_YAHOO_TICKERS}
-        for fut in as_completed(futures):
-            exc = fut.exception()
-            if exc:
-                logger.warning("Finnhub worker error: %s", exc)
-
-    logger.info("Finnhub: got %d/%d tickers", len(result), len(ALL_YAHOO_TICKERS))
+    logger.info("Yahoo: got %d/%d tickers", len(result), len(ALL_YAHOO_TICKERS))
     return result
 
 # ---------------------------------------------------------------------------
@@ -1772,6 +1826,8 @@ def monitoring_loop() -> None:
 if __name__ == "__main__":
     init_db()
     db_load_all_settings()
+    logger.info("Fetching Yahoo crumb...")
+    _refresh_yahoo_crumb()
     logger.info(
         "Spread bot v7.0 — threshold=%.1f%% step=%.1f%% interval=%ds subs=%d",
         global_threshold, alert_step, FETCH_INTERVAL, len(subscribers),
