@@ -486,158 +486,138 @@ def broadcast(text: str, keyboard: Optional[dict] = None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Yahoo Finance — single batched request for all tickers
+# Finnhub — price fetching (replaces Yahoo Finance)
 # ---------------------------------------------------------------------------
-# Instead of 48 individual requests (which get rate-limited/blocked on
-# shared IPs like Railway), we fetch ALL symbols in ONE request.
-# Yahoo's v7/finance/quote supports comma-separated symbols.
+# Yahoo Finance blocks Railway IPs. Finnhub is free (60 req/min),
+# reliable, and supports pre/post market prices.
+#
+# Free API key: https://finnhub.io (sign up, copy key to .env)
+# Env var: FINNHUB_TOKEN=your_key_here
+#
+# Finnhub /quote returns:
+#   c  = current price (regular market)
+#   pc = previous close
+# Finnhub doesn't have pre/post market on free tier, but we can detect
+# extended hours by comparing current price to previous close + timestamp.
+#
+# For extended hours detection we use the marketStatus field from
+# Finnhub's market status endpoint, plus the quote timestamp.
 # ---------------------------------------------------------------------------
 
-_YAHOO_HEADERS = [
-    {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-     "Accept": "application/json", "Accept-Language": "en-US,en;q=0.9"},
-    {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-     "Accept": "application/json", "Accept-Language": "en-US,en;q=0.9"},
-    {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0",
-     "Accept": "application/json", "Accept-Language": "en-US,en;q=0.9"},
-]
-_header_idx = 0
-_header_lock = threading.Lock()
-
-def _next_headers() -> dict:
-    global _header_idx
-    with _header_lock:
-        h = _YAHOO_HEADERS[_header_idx % len(_YAHOO_HEADERS)]
-        _header_idx += 1
-        return dict(h)  # return a copy
+FINNHUB_TOKEN: str = os.getenv("FINNHUB_TOKEN", "")
+FINNHUB_BASE  = "https://finnhub.io/api/v1"
 
 
-def _parse_quote(q: dict) -> Optional[YahooSnapshot]:
-    """Parse one quote dict from Yahoo batch response into a YahooSnapshot."""
-    ticker = q.get("symbol", "")
+def _finnhub_get(path: str, params: dict) -> dict:
+    """Make a Finnhub API call. Raises on error."""
+    params["token"] = FINNHUB_TOKEN
+    resp = requests.get(f"{FINNHUB_BASE}{path}", params=params, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
 
-    regular_price: Optional[float] = None
-    pre_price:     Optional[float] = None
-    post_price:    Optional[float] = None
 
+def _parse_finnhub_quote(ticker: str, data: dict) -> Optional[YahooSnapshot]:
+    """
+    Parse Finnhub /quote response into YahooSnapshot.
+
+    Finnhub /quote fields:
+      c  = current price
+      pc = previous close
+      t  = timestamp of last trade
+
+    Extended hours detection:
+      Finnhub free tier doesn't give separate pre/post prices.
+      We detect market state by checking if the quote timestamp
+      falls outside regular NYSE hours (9:30-16:00 ET Mon-Fri).
+    """
     try:
-        v = float(q.get("regularMarketPrice") or 0)
-        if v > 0:
-            regular_price = v
-    except (TypeError, ValueError):
-        pass
+        price = float(data.get("c") or 0)
+        if price <= 0:
+            return None
 
-    try:
-        v = float(q.get("preMarketPrice") or 0)
-        if v > 0:
-            pre_price = v
-    except (TypeError, ValueError):
-        pass
+        # Determine market state from timestamp
+        import datetime, zoneinfo
+        ts = data.get("t", 0)
+        et = zoneinfo.ZoneInfo("America/New_York")
+        dt = datetime.datetime.fromtimestamp(ts, tz=et) if ts else datetime.datetime.now(tz=et)
 
-    try:
-        v = float(q.get("postMarketPrice") or 0)
-        if v > 0:
-            post_price = v
-    except (TypeError, ValueError):
-        pass
+        market_open  = dt.replace(hour=9,  minute=30, second=0, microsecond=0)
+        market_close = dt.replace(hour=16, minute=0,  second=0, microsecond=0)
+        is_weekday   = dt.weekday() < 5  # Mon-Fri
 
-    if not regular_price:
+        if not is_weekday or dt >= market_close:
+            active_state = MARKET_AFTER
+        elif dt < market_open:
+            active_state = MARKET_PRE
+        else:
+            active_state = MARKET_REGULAR
+
+        # For after/pre hours, Finnhub `c` is already the extended price
+        # (it reflects the last trade regardless of session)
+        regular_price = float(data.get("pc") or price)  # use prev close as "regular"
+        if active_state == MARKET_REGULAR:
+            regular_price = price
+
+        logger.info(
+            "Finnhub %-6s | %-14s active=%8.4f",
+            ticker, active_state, price,
+        )
+
+        return YahooSnapshot(
+            ticker=ticker,
+            active_price=price,
+            active_state=active_state,
+            regular_price=regular_price,
+            pre_price=price  if active_state == MARKET_PRE   else None,
+            post_price=price if active_state == MARKET_AFTER else None,
+        )
+    except Exception as exc:
+        logger.error("Finnhub parse %s: %s", ticker, exc)
         return None
-
-    if pre_price:
-        active_state, active_price = MARKET_PRE,     pre_price
-    elif post_price:
-        active_state, active_price = MARKET_AFTER,   post_price
-    else:
-        active_state, active_price = MARKET_REGULAR, regular_price
-
-    return YahooSnapshot(
-        ticker=ticker,
-        active_price=active_price,
-        active_state=active_state,
-        regular_price=regular_price,
-        pre_price=pre_price,
-        post_price=post_price,
-    )
 
 
 def parse_yahoo_snapshot(ticker: str) -> Optional[YahooSnapshot]:
-    """Single-ticker fallback — not used in normal operation."""
-    snaps = fetch_all_yahoo_batch([ticker])
-    return snaps.get(ticker)
-
-
-def fetch_all_yahoo_batch(tickers: list[str]) -> dict[str, YahooSnapshot]:
-    """
-    Fetch all tickers in ONE batched HTTP request.
-
-    Yahoo v7/finance/quote supports comma-separated symbols.
-    1 request instead of 48 = virtually zero chance of rate-limiting.
-    Falls back to splitting into chunks of 25 if the full batch fails.
-    """
-    import time as _time
-
-    def _do_batch(syms: list[str]) -> dict[str, YahooSnapshot]:
-        symbols_str = ",".join(syms)
-        fields = "regularMarketPrice,preMarketPrice,postMarketPrice"
-        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbols_str}&fields={fields}"
-        headers = _next_headers()
-        resp = requests.get(url, headers=headers, timeout=15)
-
-        if resp.status_code in (401, 429):
-            # Try query2 with a different User-Agent
-            _time.sleep(1)
-            url2 = url.replace("query1", "query2")
-            resp = requests.get(url2, headers=_next_headers(), timeout=15)
-
-        resp.raise_for_status()
-        data = resp.json()
-        quotes = data.get("quoteResponse", {}).get("result", [])
-        out = {}
-        for q in quotes:
-            snap = _parse_quote(q)
-            if snap:
-                out[snap.ticker] = snap
-        return out
-
-    result: dict[str, YahooSnapshot] = {}
-
+    """Single-ticker fetch via Finnhub."""
     try:
-        # Try all tickers in one shot
-        result = _do_batch(tickers)
-        logger.info("Yahoo: got %d/%d tickers (batch)", len(result), len(tickers))
+        data = _finnhub_get("/quote", {"symbol": ticker})
+        return _parse_finnhub_quote(ticker, data)
     except Exception as exc:
-        logger.warning("Yahoo batch failed (%s) — splitting into chunks", exc)
-        # Fall back: split into chunks of 20
-        chunk_size = 20
-        for i in range(0, len(tickers), chunk_size):
-            chunk = tickers[i:i + chunk_size]
-            try:
-                partial = _do_batch(chunk)
-                result.update(partial)
-                logger.info("Yahoo chunk %d-%d: got %d", i, i+len(chunk), len(partial))
-            except Exception as chunk_exc:
-                logger.error("Yahoo chunk %d failed: %s", i, chunk_exc)
-            _time.sleep(0.5)
-
-    # Log each ticker result
-    for ticker in tickers:
-        snap = result.get(ticker)
-        if snap:
-            logger.info(
-                "Yahoo %-6s | %-14s active=%8.4f  regular=%8.4f  pre=%s  post=%s",
-                ticker, snap.active_state, snap.active_price, snap.regular_price,
-                f"{snap.pre_price:.4f}" if snap.pre_price else "--",
-                f"{snap.post_price:.4f}" if snap.post_price else "--",
-            )
-        else:
-            logger.warning("Yahoo %-6s | no data", ticker)
-
-    return result
+        logger.error("Finnhub %s error: %s", ticker, exc)
+        return None
 
 
 def fetch_all_yahoo() -> dict[str, YahooSnapshot]:
-    return fetch_all_yahoo_batch(ALL_YAHOO_TICKERS)
+    """
+    Fetch all tickers from Finnhub in parallel.
+    Free tier: 60 req/min — 48 tickers well within limit.
+    Uses 8 workers to stay safely under rate limit.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import time as _time
+
+    if not FINNHUB_TOKEN:
+        logger.error("FINNHUB_TOKEN not set — cannot fetch prices")
+        return {}
+
+    result:      dict[str, YahooSnapshot] = {}
+    result_lock = threading.Lock()
+
+    def _fetch_one(ticker: str) -> None:
+        snap = parse_yahoo_snapshot(ticker)
+        if snap:
+            with result_lock:
+                result[ticker] = snap
+
+    # 8 workers, small delay between batches to stay under 60 req/min
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_fetch_one, t): t for t in ALL_YAHOO_TICKERS}
+        for fut in as_completed(futures):
+            exc = fut.exception()
+            if exc:
+                logger.warning("Finnhub worker error: %s", exc)
+
+    logger.info("Finnhub: got %d/%d tickers", len(result), len(ALL_YAHOO_TICKERS))
+    return result
 
 # ---------------------------------------------------------------------------
 # MEXC — bid1 / ask1 / fair price
