@@ -140,6 +140,8 @@ class MexcSnapshot:
     ask1:       float
     last:       float
     fair:       float
+    bid1_size:  float = 0.0   # contracts available at bid1
+    ask1_size:  float = 0.0   # contracts available at ask1
     updated_at: float = field(default_factory=time.time)
 
 
@@ -742,9 +744,12 @@ def fetch_mexc_data() -> dict[str, MexcSnapshot]:
                     or t.get("markPrice") or t.get("fair_price")
                     or t.get("index_price") or last
                 )
+                bid1_size = float(t.get("bid1Size") or t.get("bidSize") or 0)
+                ask1_size = float(t.get("ask1Size") or t.get("askSize") or 0)
                 if bid1 > 0 and ask1 > 0:
                     result[sym] = MexcSnapshot(
-                        symbol=sym, bid1=bid1, ask1=ask1, last=last, fair=fair
+                        symbol=sym, bid1=bid1, ask1=ask1, last=last, fair=fair,
+                        bid1_size=bid1_size, ask1_size=ask1_size,
                     )
             except (TypeError, ValueError):
                 pass
@@ -788,6 +793,18 @@ def calculate_actionable_spread(
 # ---------------------------------------------------------------------------
 
 
+def format_volume(size: float) -> str:
+    if size <= 0:         return "N/A"
+    if size >= 1_000_000: return f"{size/1_000_000:.2f}M"
+    if size >= 1_000:     return f"{size/1_000:.1f}K"
+    return f"{size:.0f}"
+
+
+def calc_profit(spread_pct: float, volume_usd: float = 10_000) -> float:
+    """Estimated gross profit in USD for a given spread % and position size."""
+    return spread_pct / 100 * volume_usd
+
+
 def build_alert_keyboard(mexc_sym: str, yahoo_ticker: str) -> dict:
     return {
         "inline_keyboard": [[
@@ -799,25 +816,35 @@ def build_alert_keyboard(mexc_sym: str, yahoo_ticker: str) -> dict:
     }
 
 
-def build_alert_message(rec: SpreadRecord, is_growing: bool = False) -> str:
+def build_alert_message(
+    rec: SpreadRecord,
+    is_growing: bool = False,
+    mexc_snap: Optional["MexcSnapshot"] = None,
+) -> str:
     growing_tag = "  ⬆️ <b>GROWING</b>" if is_growing else ""
 
     if rec.direction == "SHORT":
-        # MEXC bid1 > Yahoo — MEXC on top
         signal_icon  = "🔴"
         signal_label = "SHORT"
-        top_label    = f"MEXC Futures (bid1)"
+        top_label    = "MEXC Futures (bid1)"
         top_price    = rec.actionable_price
         bot_label    = f"Yahoo Finance ({rec.market_state})"
         bot_price    = rec.yahoo_price
+        vol_label    = "bid1 volume"
+        vol_size     = mexc_snap.bid1_size if mexc_snap else 0
     else:
-        # Yahoo > MEXC ask1 — Yahoo on top
         signal_icon  = "🟢"
         signal_label = "LONG"
         top_label    = f"Yahoo Finance ({rec.market_state})"
         top_price    = rec.yahoo_price
-        bot_label    = f"MEXC Futures (ask1)"
+        bot_label    = "MEXC Futures (ask1)"
         bot_price    = rec.actionable_price
+        vol_label    = "ask1 volume"
+        vol_size     = mexc_snap.ask1_size if mexc_snap else 0
+
+    price_diff    = abs(rec.actionable_price - rec.yahoo_price)
+    ba_spread_pct = (rec.ask1 - rec.bid1) / rec.bid1 * 100 if rec.bid1 > 0 else 0
+    profit_10k    = calc_profit(rec.spread_pct)
 
     return (
         f"{signal_icon} <b>{signal_label} {rec.display}</b> | "
@@ -825,7 +852,10 @@ def build_alert_message(rec: SpreadRecord, is_growing: bool = False) -> str:
         f"📌 <b>{top_label}:</b>  <code>${top_price:.4f}</code>\n"
         f"📌 <b>{bot_label}:</b>  <code>${bot_price:.4f}</code>\n\n"
         f"📐 <b>MEXC Fair Price:</b>  <code>${rec.fair:.4f}</code>\n"
-        f"💰 <b>Diff:</b>  <code>${abs(rec.actionable_price - rec.yahoo_price):.4f}</code>"
+        f"💰 <b>Diff:</b>  <code>${price_diff:.4f}</code>\n\n"
+        f"📦 <b>{vol_label}:</b>  <code>{format_volume(vol_size)}</code>\n"
+        f"↔️ <b>Bid-ask spread:</b>  <code>{ba_spread_pct:.3f}%</code>\n"
+        f"💵 <b>Profit $10K:</b>  <code>~${profit_10k:.2f}</code>"
     )
 
 
@@ -833,8 +863,9 @@ def send_spread_alert(
     rec: SpreadRecord,
     is_growing: bool = False,
     chat_id: Optional[int] = None,
+    mexc_snap: Optional[MexcSnapshot] = None,
 ) -> None:
-    text     = build_alert_message(rec, is_growing)
+    text     = build_alert_message(rec, is_growing, mexc_snap=mexc_snap)
     keyboard = build_alert_keyboard(rec.mexc_sym, rec.yahoo_ticker)
     if chat_id:
         tg_send(chat_id, text, keyboard)
@@ -989,12 +1020,14 @@ def handle_check(chat_id: int, args: list[str]) -> None:
     else:
         spread_lines = "\n<b>Actionable Spread</b>\n  No actionable spread right now.\n"
 
-    age = int(time.time() - (yahoo_snap.updated_at if yahoo_snap else time.time()))
+    age      = int(time.time() - (yahoo_snap.updated_at if yahoo_snap else time.time()))
+    keyboard = build_alert_keyboard(mexc_sym, yahoo_ticker)
     tg_send(
         chat_id,
         f"🔍 <b>Check: {display}</b>\n\n"
         + yahoo_lines + mexc_lines + spread_lines
-        + f"\n<i>Data age: {age}s</i>"
+        + f"\n<i>Data age: {age}s</i>",
+        keyboard,
     )
 
 
@@ -1755,11 +1788,26 @@ def notify_tracked_price_changes(yahoo_snaps: dict[str, "YahooSnapshot"]) -> Non
                 "Regular Market": "🟡",
             }.get(snap.active_state, "📡")
 
+            # Check if there's an active spread for this symbol
+            spread_info = ""
+            for mexc_sym_k, (yt_k, _) in SYMBOL_MAP.items():
+                if yt_k == yahoo_ticker:
+                    sr = spread_cache.get(mexc_sym_k)
+                    if sr:
+                        profit = calc_profit(sr.spread_pct)
+                        dir_icon = "🔴 SHORT" if sr.direction == "SHORT" else "🟢 LONG"
+                        spread_info = (
+                            f"\n\n📈 <b>Active spread:</b> {dir_icon} {sr.spread_pct:.2f}%\n"
+                            f"💵 <b>Profit $10K:</b>  <code>~${profit:.2f}</code>"
+                        )
+                    break
+
             tg_send(chat_id,
                 f"{arrow} <b>{display}</b> — Yahoo price update\n\n"
                 f"📌 New price: <b>${new_price:.4f}</b>\n"
                 f"📊 Change: <b>{change:+.4f} ({change_pct:+.2f}%)</b>\n"
                 f"{state_icon} {snap.active_state}"
+                f"{spread_info}"
             )
 
 
@@ -2052,6 +2100,18 @@ def monitoring_loop() -> None:
                 )
                 continue
 
+            # Skip if bid-ask spread > 1.5% — data is likely unreliable
+            if bid1 > 0 and ask1 > 0:
+                ba_spread_pct = (ask1 - bid1) / bid1 * 100
+                if ba_spread_pct > 1.5:
+                    logger.debug(
+                        "Skipping %s — bid-ask spread %.2f%% > 1.5%% (bid=%.4f ask=%.4f)",
+                        display, ba_spread_pct, bid1, ask1,
+                    )
+                    with state_lock:
+                        spread_cache.pop(mexc_sym, None)
+                    continue
+
             result = calculate_actionable_spread(bid1, ask1, yahoo_price)
 
             if result is None:
@@ -2135,7 +2195,7 @@ def monitoring_loop() -> None:
             if should_alert:
                 threading.Thread(
                     target=send_spread_alert,
-                    args=(rec, is_growing),
+                    args=(rec, is_growing, None, mexc_data.get(mexc_sym)),
                     daemon=True,
                 ).start()
 
