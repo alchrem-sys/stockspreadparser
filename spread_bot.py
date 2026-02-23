@@ -329,6 +329,10 @@ yahoo_cache:       dict[str, YahooSnapshot] = {}
 
 # /track state: chat_id → {yahoo_ticker: last_seen_price}
 tracked_prices: dict[int, dict[str, float]] = {}
+
+# /change override: None = auto-detect from Yahoo marketState
+# Values: "auto" | "regular" | "pre" | "post"
+price_mode_override: str = "auto"
 mexc_cache:        dict[str, MexcSnapshot]  = {}
 spread_cache:      dict[str, SpreadRecord]  = {}
 peak_spread:       dict[str, float]         = {}
@@ -625,23 +629,36 @@ def _parse_quote(q: dict) -> Optional[YahooSnapshot]:
     if not regular_price:
         return None
 
-    # Log raw Yahoo state so we can debug price selection
     logger.info(
-        "Yahoo raw %-6s | marketState=%s  regular=%.4f  pre=%s  post=%s",
+        "Yahoo raw %-6s | marketState=%s  regular=%.4f  pre=%s  post=%s  mode=%s",
         ticker, market_state, regular_price or 0,
         f"{pre_price:.4f}"  if pre_price  else "none",
         f"{post_price:.4f}" if post_price else "none",
+        price_mode_override,
     )
 
-    # Price selection — priority: pre > post > regular
-    # We use price fields directly (not just marketState) because Yahoo
-    # sometimes returns unexpected marketState values (e.g. "REGULAR" after close)
-    if pre_price:
-        active_state, active_price = MARKET_PRE,     pre_price
-    elif post_price:
-        active_state, active_price = MARKET_AFTER,   post_price
+    # Price selection:
+    # If admin used /change to set an explicit mode → honour it unconditionally.
+    # Otherwise use Yahoo marketState as authoritative source.
+    mode = price_mode_override  # snapshot to avoid race
+
+    if mode == "pre":
+        active_state = MARKET_PRE
+        active_price = pre_price or regular_price
+    elif mode == "post":
+        active_state = MARKET_AFTER
+        active_price = post_price or regular_price
+    elif mode == "regular":
+        active_state = MARKET_REGULAR
+        active_price = regular_price
     else:
-        active_state, active_price = MARKET_REGULAR, regular_price
+        # auto — trust Yahoo marketState field
+        if market_state in ("PRE", "PREPRE") and pre_price:
+            active_state, active_price = MARKET_PRE,     pre_price
+        elif market_state in ("POST", "POSTPOST", "CLOSED") and post_price:
+            active_state, active_price = MARKET_AFTER,   post_price
+        else:
+            active_state, active_price = MARKET_REGULAR, regular_price
 
     return YahooSnapshot(
         ticker=ticker,
@@ -1245,6 +1262,8 @@ def handle_help(chat_id: int) -> None:
             "/subscribers — list subscribers\n"
             "/test    — send test alert\n"
             "/missing — symbols with no data\n"
+            "/say Hello everyone! — broadcast to all subscribers\n"
+            "/change — show/set price mode (auto/pre/post/regular)\n"
         )
     tg_send(
         chat_id,
@@ -1255,6 +1274,8 @@ def handle_help(chat_id: int) -> None:
         "/check TSLA — debug one symbol\n"
         "/status — bot status\n"
         "/help   — this message\n"
+        "/track GS — get notified on every Yahoo price change\n"
+        "/untrack GS — stop tracking\n"
         "/start · /stop — subscribe/unsubscribe"
         f"{admin_section}\n\n"
         "<b>Legend</b>\n"
@@ -1520,6 +1541,92 @@ def handle_subscribers(chat_id: int) -> None:
         total = len(subscribers)
     for chunk in [lines[i:i+30] for i in range(0, len(lines), 30)]:
         tg_send(chat_id, f"👥 <b>Subscribers ({total}):</b>\n\n" + "\n\n".join(chunk))
+
+
+def handle_say(chat_id: int, args: list[str]) -> None:
+    """Broadcast a message to all subscribers."""
+    if chat_id != ADMIN_ID:
+        tg_send(chat_id, "⛔ Admin only.")
+        return
+    if not args:
+        tg_send(chat_id, "Usage: <code>/say Your message here</code>")
+        return
+
+    text = "📢 <b>Bot message:</b>\n\n" + " ".join(args)
+    subs = list(subscribers)
+    if not subs:
+        tg_send(chat_id, "⚠️ No subscribers to send to.")
+        return
+
+    sent, failed = 0, 0
+    for sub_id in subs:
+        try:
+            tg_send(sub_id, text)
+            sent += 1
+        except Exception:
+            failed += 1
+
+    tg_send(chat_id, f"✅ Sent to <b>{sent}</b> subscriber(s). Failed: <b>{failed}</b>.")
+
+
+def handle_change(chat_id: int, args: list[str]) -> None:
+    """
+    /change auto|regular|pre|post
+
+    Manually override which Yahoo price field the bot uses.
+    Useful when market transitions and auto-detect picks the wrong price.
+
+      /change auto    — let Yahoo marketState decide (default)
+      /change regular — always use regularMarketPrice (market hours close price)
+      /change pre     — always use preMarketPrice
+      /change post    — always use postMarketPrice (after-hours)
+      /change         — show current mode
+    """
+    global price_mode_override
+
+    if chat_id != ADMIN_ID:
+        tg_send(chat_id, "⛔ Admin only.")
+        return
+
+    valid = {"auto", "regular", "pre", "post"}
+
+    if not args:
+        mode_desc = {
+            "auto":    "🤖 Auto (Yahoo marketState decides)",
+            "regular": "🟡 Regular market price",
+            "pre":     "🌅 Pre-market price",
+            "post":    "🌙 After-hours / post-market price",
+        }
+        tg_send(chat_id,
+            f"📡 <b>Current price mode:</b> {mode_desc.get(price_mode_override, price_mode_override)}\n\n"
+            "<b>Available modes:</b>\n"
+            "  /change auto    — let Yahoo decide\n"
+            "  /change regular — force regular close price\n"
+            "  /change pre     — force pre-market price\n"
+            "  /change post    — force after-hours price"
+        )
+        return
+
+    mode = args[0].lower()
+    if mode not in valid:
+        tg_send(chat_id,
+            f"❌ Unknown mode <b>{mode}</b>.\n"
+            f"Valid: {', '.join(sorted(valid))}")
+        return
+
+    price_mode_override = mode
+    mode_desc = {
+        "auto":    "🤖 Auto (Yahoo marketState decides)",
+        "regular": "🟡 Forced: Regular market price",
+        "pre":     "🌅 Forced: Pre-market price",
+        "post":    "🌙 Forced: After-hours price",
+    }
+    tg_send(chat_id,
+        f"✅ Price mode set to: <b>{mode_desc[mode]}</b>\n\n"
+        "The next fetch cycle will use this price.\n"
+        "Use <code>/change auto</code> to go back to auto-detect."
+    )
+    logger.info("Price mode override set to: %s by admin", mode)
 
 
 def handle_track(chat_id: int, args: list[str]) -> None:
@@ -1857,6 +1964,8 @@ def dispatch(update: dict) -> None:
         "/subscribers":  lambda: handle_subscribers(chat_id),
         "/track":        lambda: handle_track(chat_id, args),
         "/untrack":      lambda: handle_untrack(chat_id, args),
+        "/say":          lambda: handle_say(chat_id, args),
+        "/change":       lambda: handle_change(chat_id, args),
         "/test":         lambda: handle_test(chat_id),
         "/missing":      lambda: handle_missing(chat_id),
         # ── admin (short) ─────────────────────────────────────
