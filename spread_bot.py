@@ -558,7 +558,7 @@ def _yahoo_quote_batch(tickers: list[str]) -> list[dict]:
     symbols = ",".join(tickers)
     params  = {
         "symbols": symbols,
-        "fields":  "regularMarketPrice,preMarketPrice,postMarketPrice,marketState",
+        "fields":  "regularMarketPrice,preMarketPrice,postMarketPrice,marketState,regularMarketTime,postMarketTime,preMarketTime",
         "crumb":   _yahoo_crumb or "",
     }
     headers = {
@@ -579,8 +579,20 @@ def _yahoo_quote_batch(tickers: list[str]) -> list[dict]:
 
 
 def _parse_quote(q: dict) -> Optional[YahooSnapshot]:
-    """Parse one Yahoo quote dict into YahooSnapshot."""
-    ticker = q.get("symbol", "")
+    """
+    Parse one Yahoo quote dict into YahooSnapshot.
+
+    Uses Yahoo's explicit `marketState` field to determine which price to use:
+      PRE    → preMarketPrice   (pre-market session active)
+      POST   → postMarketPrice  (after-hours session active)
+      REGULAR→ regularMarketPrice (market open)
+      CLOSED → regularMarketPrice (market closed, no extended hours trading)
+
+    This avoids the stale price bug where postMarketPrice from a previous
+    session gets used even though the market has since opened and closed again.
+    """
+    ticker       = q.get("symbol", "")
+    market_state = (q.get("marketState") or "").upper()  # PRE, REGULAR, POST, CLOSED, PREPRE, POSTPOST
 
     regular_price: Optional[float] = None
     pre_price:     Optional[float] = None
@@ -610,12 +622,38 @@ def _parse_quote(q: dict) -> Optional[YahooSnapshot]:
     if not regular_price:
         return None
 
-    if pre_price:
+    # Use marketState + available prices to decide:
+    #
+    #  PRE / PREPRE          → pre-market session   → use preMarketPrice
+    #  POST / POSTPOST        → after-hours session  → use postMarketPrice
+    #  CLOSED + postMarketPrice exists → overnight/after-hours still updating → use postMarketPrice
+    #  CLOSED + no post price → fully closed, no extended hours → use regularMarketPrice
+    #  REGULAR                → market open          → use regularMarketPrice
+    #
+    # The GS example: state=CLOSED, postMarketPrice=$141.76 → we use $141.76 ✅
+    # The old bug:    state=CLOSED, stale postMarketPrice from days ago → we were using it ❌
+    # The fix for old bug was wrong — it cleared ALL post prices on CLOSED.
+    # Real fix: trust postMarketPrice on CLOSED only when it's fresh (same day).
+    # We approximate "fresh" by checking postMarketTime vs regularMarketTime.
+
+    post_time    = q.get("postMarketTime",    0) or 0
+    regular_time = q.get("regularMarketTime", 0) or 0
+
+    # postMarketPrice is fresh if its timestamp is AFTER the regular market close
+    post_is_fresh = post_time > regular_time
+
+    if market_state in ("PRE", "PREPRE") and pre_price:
         active_state, active_price = MARKET_PRE,     pre_price
-    elif post_price:
+    elif market_state in ("POST", "POSTPOST") and post_price:
+        active_state, active_price = MARKET_AFTER,   post_price
+    elif market_state == "CLOSED" and post_price and post_is_fresh:
+        # After-hours price exists and is newer than regular close → use it
         active_state, active_price = MARKET_AFTER,   post_price
     else:
+        # REGULAR, or CLOSED with no fresh after-hours → use regular price
         active_state, active_price = MARKET_REGULAR, regular_price
+        pre_price  = None
+        post_price = None
 
     return YahooSnapshot(
         ticker=ticker,
@@ -1208,7 +1246,9 @@ def handle_help(chat_id: int) -> None:
             "/mute 30 — mute N minutes\n"
             "/unmute — unmute\n"
             "/muteall GS NKE — mute all except listed\n"
-            "/unmuteall — unmute all\n"
+            "/add GS NKE — add symbols to muteall exceptions\n"
+            "/remove GS — remove symbol from exceptions\n"
+            "/unmuteall — disable muteall\n"
             "\n"
             "/setthreshold GS 0.3 — custom threshold\n"
             "/delthreshold GS — remove custom threshold\n"
@@ -1417,6 +1457,61 @@ def handle_unmuteall(chat_id: int) -> None:
     muteall_exceptions = set()
     db_save_all_settings()
     tg_send(chat_id, "🔔 <b>MuteAll disabled!</b>")
+
+
+def handle_add_exception(chat_id: int, args: list[str]) -> None:
+    """Add one or more symbols to muteall exceptions without changing anything else."""
+    global muteall_exceptions
+    if chat_id != ADMIN_ID:
+        tg_send(chat_id, "⛔ Admin only.")
+        return
+    if not args:
+        tg_send(chat_id, "Usage: <code>/add GS NKE</code>")
+        return
+    added, failed = [], []
+    for a in args:
+        mexc = resolve_symbol(a.upper())
+        if mexc:
+            added.append(SYMBOL_MAP[mexc][1].upper())
+        else:
+            failed.append(a.upper())
+    muteall_exceptions.update(added)
+    db_save_all_settings()
+    exc_list  = ", ".join(f"<b>{s}</b>" for s in sorted(muteall_exceptions))
+    add_text  = ", ".join(f"<b>{s}</b>" for s in added)
+    fail_text = ("\n⚠️ Not found: " + ", ".join(failed)) if failed else ""
+    status    = "🔕 MuteAll ON" if muteall_active else "ℹ️ MuteAll is OFF (exceptions saved for when you enable it)"
+    tg_send(chat_id,
+        f"✅ Added: {add_text}{fail_text}\n"
+        f"Now alerting: {exc_list}\n"
+        f"{status}")
+
+
+def handle_remove_exception(chat_id: int, args: list[str]) -> None:
+    """Remove one or more symbols from muteall exceptions."""
+    global muteall_exceptions
+    if chat_id != ADMIN_ID:
+        tg_send(chat_id, "⛔ Admin only.")
+        return
+    if not args:
+        tg_send(chat_id, "Usage: <code>/remove GS NKE</code>")
+        return
+    removed, failed = [], []
+    for a in args:
+        mexc = resolve_symbol(a.upper())
+        display = SYMBOL_MAP[mexc][1].upper() if mexc else a.upper()
+        if display in muteall_exceptions:
+            muteall_exceptions.discard(display)
+            removed.append(display)
+        else:
+            failed.append(display)
+    db_save_all_settings()
+    exc_list    = ", ".join(f"<b>{s}</b>" for s in sorted(muteall_exceptions)) if muteall_exceptions else "none"
+    remove_text = ", ".join(f"<b>{s}</b>" for s in removed)
+    fail_text   = ("\n⚠️ Not in exceptions: " + ", ".join(failed)) if failed else ""
+    tg_send(chat_id,
+        f"✅ Removed: {remove_text}{fail_text}\n"
+        f"Now alerting: {exc_list}")
 
 
 def handle_subscribers(chat_id: int) -> None:
@@ -1634,6 +1729,8 @@ def dispatch(update: dict) -> None:
         "/mute":         lambda: handle_mute(chat_id, args),
         "/unmute":       lambda: handle_unmute(chat_id),
         "/muteall":      lambda: handle_muteall(chat_id, args),
+        "/add":          lambda: handle_add_exception(chat_id, args),
+        "/remove":       lambda: handle_remove_exception(chat_id, args),
         "/unmuteall":    lambda: handle_unmuteall(chat_id),
         "/subscribers":  lambda: handle_subscribers(chat_id),
         "/test":         lambda: handle_test(chat_id),
