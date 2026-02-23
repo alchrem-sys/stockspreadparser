@@ -12,6 +12,7 @@ Version: 7.0.0
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -1295,6 +1296,7 @@ def handle_help(chat_id: int) -> None:
             "/subscribers — list subscribers\n"
             "/test    — send test alert\n"
             "/missing — symbols with no data\n"
+            "/restart — restart the bot process\n"
             "/say Hello everyone! — broadcast to all subscribers\n"
             "/change — show/set price mode (auto/pre/post/regular)\n"
         )
@@ -1811,6 +1813,16 @@ def notify_tracked_price_changes(yahoo_snaps: dict[str, "YahooSnapshot"]) -> Non
             )
 
 
+def handle_restart(chat_id: int) -> None:
+    if chat_id != ADMIN_ID:
+        tg_send(chat_id, "⛔ Admin only.")
+        return
+    tg_send(chat_id, "🔄 Restarting bot... reconnecting in a few seconds.")
+    logger.info("Manual restart triggered by admin (chat_id=%d)", chat_id)
+    time.sleep(1)
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 def handle_test(chat_id: int) -> None:
     if chat_id != ADMIN_ID:
         tg_send(chat_id, "⛔ Admin only.")
@@ -2015,6 +2027,7 @@ def dispatch(update: dict) -> None:
         "/say":          lambda: handle_say(chat_id, args),
         "/change":       lambda: handle_change(chat_id, args),
         "/test":         lambda: handle_test(chat_id),
+        "/restart":      lambda: handle_restart(chat_id),
         "/missing":      lambda: handle_missing(chat_id),
         # ── admin (short) ─────────────────────────────────────
         "/a":            lambda: handle_admin_cmd(chat_id),
@@ -2100,12 +2113,12 @@ def monitoring_loop() -> None:
                 )
                 continue
 
-            # Skip if bid-ask spread > 1.5% — data is likely unreliable
+            # Skip if bid-ask spread > 1.0% — data is likely unreliable
             if bid1 > 0 and ask1 > 0:
                 ba_spread_pct = (ask1 - bid1) / bid1 * 100
-                if ba_spread_pct > 1.5:
+                if ba_spread_pct > 1.0:
                     logger.debug(
-                        "Skipping %s — bid-ask spread %.2f%% > 1.5%% (bid=%.4f ask=%.4f)",
+                        "Skipping %s — bid-ask spread %.2f%% > 1.0%% (bid=%.4f ask=%.4f)",
                         display, ba_spread_pct, bid1, ask1,
                     )
                     with state_lock:
