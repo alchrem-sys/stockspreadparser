@@ -326,6 +326,9 @@ def db_delete_subscriber(chat_id: int) -> None:
 # ---------------------------------------------------------------------------
 
 yahoo_cache:       dict[str, YahooSnapshot] = {}
+
+# /track state: chat_id → {yahoo_ticker: last_seen_price}
+tracked_prices: dict[int, dict[str, float]] = {}
 mexc_cache:        dict[str, MexcSnapshot]  = {}
 spread_cache:      dict[str, SpreadRecord]  = {}
 peak_spread:       dict[str, float]         = {}
@@ -1519,6 +1522,140 @@ def handle_subscribers(chat_id: int) -> None:
         tg_send(chat_id, f"👥 <b>Subscribers ({total}):</b>\n\n" + "\n\n".join(chunk))
 
 
+def handle_track(chat_id: int, args: list[str]) -> None:
+    """
+    /track GS — subscribe to Yahoo price change notifications for a symbol.
+    Every time Yahoo updates the price (any change), sends a message.
+    No spam — only fires when price actually changes since last fetch.
+    """
+    global tracked_prices
+
+    if not args:
+        # Show current tracked symbols for this user
+        user_tracked = tracked_prices.get(chat_id, {})
+        if not user_tracked:
+            tg_send(chat_id,
+                "📡 You are not tracking any symbols.\n"
+                "Usage: <code>/track GS</code>")
+        else:
+            lines = []
+            for yahoo_ticker, last_price in sorted(user_tracked.items()):
+                # Find display name
+                display = next(
+                    (v[1].upper() for v in SYMBOL_MAP.values() if v[0] == yahoo_ticker),
+                    yahoo_ticker
+                )
+                price_str = f"${last_price:.4f}" if last_price else "waiting..."
+                lines.append(f"  📌 <b>{display}</b> — last seen {price_str}")
+            tg_send(chat_id,
+                f"📡 <b>Tracking {len(user_tracked)} symbol(s):</b>\n" +
+                "\n".join(lines) +
+                "\n\n/untrack SYMBOL to stop")
+        return
+
+    added, failed = [], []
+    for arg in args:
+        mexc = resolve_symbol(arg.upper())
+        if not mexc:
+            failed.append(arg.upper())
+            continue
+        yahoo_ticker, display = SYMBOL_MAP[mexc]
+        display = display.upper()
+
+        if chat_id not in tracked_prices:
+            tracked_prices[chat_id] = {}
+
+        if yahoo_ticker in tracked_prices[chat_id]:
+            tg_send(chat_id, f"ℹ️ Already tracking <b>{display}</b>.")
+            continue
+
+        # Seed with current price so first update shows actual change
+        current_snap = yahoo_cache.get(yahoo_ticker)
+        seed_price   = current_snap.active_price if current_snap else 0.0
+        tracked_prices[chat_id][yahoo_ticker] = seed_price
+        added.append(display)
+
+    if added:
+        tg_send(chat_id,
+            f"✅ Now tracking: {', '.join(f'<b>{d}</b>' for d in added)}\n"
+            "You'll get a message every time the Yahoo price changes.\n"
+            "/untrack to stop.")
+    if failed:
+        tg_send(chat_id, f"❌ Unknown symbols: {', '.join(failed)}")
+
+
+def handle_untrack(chat_id: int, args: list[str]) -> None:
+    if not args:
+        # Untrack everything
+        if chat_id in tracked_prices:
+            del tracked_prices[chat_id]
+        tg_send(chat_id, "🔕 Stopped tracking all symbols.")
+        return
+
+    user_tracked = tracked_prices.get(chat_id, {})
+    removed, failed = [], []
+    for arg in args:
+        mexc = resolve_symbol(arg.upper())
+        if not mexc:
+            failed.append(arg.upper())
+            continue
+        yahoo_ticker, display = SYMBOL_MAP[mexc]
+        display = display.upper()
+        if yahoo_ticker in user_tracked:
+            del user_tracked[yahoo_ticker]
+            removed.append(display)
+        else:
+            failed.append(display)
+
+    if removed:
+        tg_send(chat_id, f"🔕 Stopped tracking: {', '.join(f'<b>{d}</b>' for d in removed)}")
+    if failed:
+        tg_send(chat_id, f"❌ Not tracking: {', '.join(failed)}")
+
+
+def notify_tracked_price_changes(yahoo_snaps: dict[str, "YahooSnapshot"]) -> None:
+    """
+    Called every monitoring cycle. For each tracked symbol, if the Yahoo price
+    has changed since last seen → send a message to the subscriber.
+    Only fires on actual price changes, not every minute.
+    """
+    if not tracked_prices:
+        return
+
+    for chat_id, user_map in list(tracked_prices.items()):
+        for yahoo_ticker, last_price in list(user_map.items()):
+            snap = yahoo_snaps.get(yahoo_ticker)
+            if not snap:
+                continue
+            new_price = snap.active_price
+            if new_price == last_price:
+                continue  # no change, skip
+
+            # Price changed — notify
+            tracked_prices[chat_id][yahoo_ticker] = new_price
+
+            # Find display name
+            display = next(
+                (v[1].upper() for v in SYMBOL_MAP.values() if v[0] == yahoo_ticker),
+                yahoo_ticker
+            )
+            change     = new_price - last_price
+            change_pct = change / last_price * 100 if last_price else 0
+            arrow      = "📈" if change > 0 else "📉"
+            state_icon = {
+                "Pre-Market":  "🌅",
+                "After-Hours": "🌙",
+                "Regular Market": "🟡",
+            }.get(snap.active_state, "📡")
+
+            tg_send(chat_id,
+                f"{arrow} <b>{display}</b> — Yahoo price update\n\n"
+                f"📌 New price: <b>${new_price:.4f}</b>\n"
+                f"📊 Change: <b>{change:+.4f} ({change_pct:+.2f}%)</b>\n"
+                f"{state_icon} {snap.active_state}"
+            )
+
+
 def handle_test(chat_id: int) -> None:
     if chat_id != ADMIN_ID:
         tg_send(chat_id, "⛔ Admin only.")
@@ -1718,6 +1855,8 @@ def dispatch(update: dict) -> None:
         "/remove":       lambda: handle_remove_exception(chat_id, args),
         "/unmuteall":    lambda: handle_unmuteall(chat_id),
         "/subscribers":  lambda: handle_subscribers(chat_id),
+        "/track":        lambda: handle_track(chat_id, args),
+        "/untrack":      lambda: handle_untrack(chat_id, args),
         "/test":         lambda: handle_test(chat_id),
         "/missing":      lambda: handle_missing(chat_id),
         # ── admin (short) ─────────────────────────────────────
@@ -1778,6 +1917,8 @@ def monitoring_loop() -> None:
 
         # Notify if any ticker changed market state
         check_and_notify_state_changes(yahoo_snaps)
+        # Notify /track subscribers of price changes
+        notify_tracked_price_changes(yahoo_snaps)
 
         matched = 0
 
