@@ -622,25 +622,23 @@ def _parse_quote(q: dict) -> Optional[YahooSnapshot]:
     if not regular_price:
         return None
 
-    # Use marketState + available prices to decide:
-    #
-    #  PRE / PREPRE               → pre-market session  → use preMarketPrice
-    #  POST / POSTPOST / CLOSED   → after-hours exists  → use postMarketPrice if present
-    #  REGULAR                    → market open         → use regularMarketPrice
-    #
-    # Yahoo only populates postMarketPrice when there is actual after-hours
-    # activity — so if it's non-zero, it's the right price to use.
-    # We trust Yahoo's own marketState field completely.
+    # Log raw Yahoo state so we can debug price selection
+    logger.info(
+        "Yahoo raw %-6s | marketState=%s  regular=%.4f  pre=%s  post=%s",
+        ticker, market_state, regular_price or 0,
+        f"{pre_price:.4f}"  if pre_price  else "none",
+        f"{post_price:.4f}" if post_price else "none",
+    )
 
-    if market_state in ("PRE", "PREPRE") and pre_price:
+    # Price selection — priority: pre > post > regular
+    # We use price fields directly (not just marketState) because Yahoo
+    # sometimes returns unexpected marketState values (e.g. "REGULAR" after close)
+    if pre_price:
         active_state, active_price = MARKET_PRE,     pre_price
-    elif market_state in ("POST", "POSTPOST", "CLOSED") and post_price:
+    elif post_price:
         active_state, active_price = MARKET_AFTER,   post_price
     else:
-        # REGULAR or CLOSED with no post price → use regular close
         active_state, active_price = MARKET_REGULAR, regular_price
-        pre_price  = None
-        post_price = None
 
     return YahooSnapshot(
         ticker=ticker,
