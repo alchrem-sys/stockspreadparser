@@ -624,33 +624,20 @@ def _parse_quote(q: dict) -> Optional[YahooSnapshot]:
 
     # Use marketState + available prices to decide:
     #
-    #  PRE / PREPRE          → pre-market session   → use preMarketPrice
-    #  POST / POSTPOST        → after-hours session  → use postMarketPrice
-    #  CLOSED + postMarketPrice exists → overnight/after-hours still updating → use postMarketPrice
-    #  CLOSED + no post price → fully closed, no extended hours → use regularMarketPrice
-    #  REGULAR                → market open          → use regularMarketPrice
+    #  PRE / PREPRE               → pre-market session  → use preMarketPrice
+    #  POST / POSTPOST / CLOSED   → after-hours exists  → use postMarketPrice if present
+    #  REGULAR                    → market open         → use regularMarketPrice
     #
-    # The GS example: state=CLOSED, postMarketPrice=$141.76 → we use $141.76 ✅
-    # The old bug:    state=CLOSED, stale postMarketPrice from days ago → we were using it ❌
-    # The fix for old bug was wrong — it cleared ALL post prices on CLOSED.
-    # Real fix: trust postMarketPrice on CLOSED only when it's fresh (same day).
-    # We approximate "fresh" by checking postMarketTime vs regularMarketTime.
-
-    post_time    = q.get("postMarketTime",    0) or 0
-    regular_time = q.get("regularMarketTime", 0) or 0
-
-    # postMarketPrice is fresh if its timestamp is AFTER the regular market close
-    post_is_fresh = post_time > regular_time
+    # Yahoo only populates postMarketPrice when there is actual after-hours
+    # activity — so if it's non-zero, it's the right price to use.
+    # We trust Yahoo's own marketState field completely.
 
     if market_state in ("PRE", "PREPRE") and pre_price:
         active_state, active_price = MARKET_PRE,     pre_price
-    elif market_state in ("POST", "POSTPOST") and post_price:
-        active_state, active_price = MARKET_AFTER,   post_price
-    elif market_state == "CLOSED" and post_price and post_is_fresh:
-        # After-hours price exists and is newer than regular close → use it
+    elif market_state in ("POST", "POSTPOST", "CLOSED") and post_price:
         active_state, active_price = MARKET_AFTER,   post_price
     else:
-        # REGULAR, or CLOSED with no fresh after-hours → use regular price
+        # REGULAR or CLOSED with no post price → use regular close
         active_state, active_price = MARKET_REGULAR, regular_price
         pre_price  = None
         post_price = None
