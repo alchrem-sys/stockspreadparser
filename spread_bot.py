@@ -1891,6 +1891,74 @@ def handle_test(chat_id: int) -> None:
 
 
 
+def handle_yahoo_debug(chat_id: int, args: list[str]) -> None:
+    """
+    /ydebug GS — fetch raw Yahoo API response for a ticker and show ALL fields.
+    Useful to see exactly what postMarketPrice, postMarketTime etc. Yahoo returns.
+    """
+    if chat_id != ADMIN_ID:
+        tg_send(chat_id, "⛔ Admin only.")
+        return
+    if not args:
+        tg_send(chat_id, "Usage: <code>/ydebug GS</code>")
+        return
+
+    mexc_sym = resolve_symbol(args[0].upper())
+    if not mexc_sym:
+        tg_send(chat_id, f"❌ Unknown symbol: {args[0].upper()}")
+        return
+
+    yahoo_ticker, display = SYMBOL_MAP[mexc_sym]
+    tg_send(chat_id, f"🔍 Fetching raw Yahoo data for <b>{display}</b> ({yahoo_ticker})...")
+
+    try:
+        results = _yahoo_quote_batch([yahoo_ticker])
+        if not results:
+            tg_send(chat_id, "❌ No results returned from Yahoo API.")
+            return
+
+        q = results[0]
+
+        # Extract all relevant fields
+        regular_price  = q.get("regularMarketPrice")
+        regular_time   = q.get("regularMarketTime")
+        pre_price      = q.get("preMarketPrice")
+        pre_time       = q.get("preMarketTime")
+        post_price     = q.get("postMarketPrice")
+        post_time      = q.get("postMarketTime")
+        market_state   = q.get("marketState")
+
+        def fmt_ts(ts) -> str:
+            if not ts:
+                return "none"
+            import datetime
+            try:
+                return datetime.datetime.utcfromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S UTC")
+            except Exception:
+                return str(ts)
+
+        regular_fresh = int(regular_time or 0)
+        pre_fresh     = int(pre_time  or 0) > regular_fresh
+        post_fresh    = int(post_time or 0) > regular_fresh
+
+        tg_send(chat_id,
+            f"📡 <b>Raw Yahoo API: {display} ({yahoo_ticker})</b>\n\n"
+            f"<b>marketState:</b> <code>{market_state}</code>\n\n"
+            f"<b>regularMarketPrice:</b> <code>${regular_price}</code>\n"
+            f"<b>regularMarketTime:</b>  <code>{fmt_ts(regular_time)}</code>\n\n"
+            f"<b>preMarketPrice:</b>     <code>${pre_price}</code>\n"
+            f"<b>preMarketTime:</b>      <code>{fmt_ts(pre_time)}</code>\n"
+            f"<b>pre is FRESH:</b>       <code>{pre_fresh}</code>\n\n"
+            f"<b>postMarketPrice:</b>    <code>${post_price}</code>\n"
+            f"<b>postMarketTime:</b>     <code>{fmt_ts(post_time)}</code>\n"
+            f"<b>post is FRESH:</b>      <code>{post_fresh}</code>\n\n"
+            f"<b>→ Bot would use:</b>    <code>${pre_price if pre_fresh else (post_price if post_fresh else regular_price)}</code>"
+        )
+
+    except Exception as exc:
+        tg_send(chat_id, f"❌ Error: {exc}")
+
+
 def handle_missing(chat_id: int) -> None:
     """
     Show exactly which symbols are missing from /prices and why.
@@ -2084,6 +2152,7 @@ def dispatch(update: dict) -> None:
         "/onlyadmin":    lambda: handle_onlyadmin(chat_id),
         "/allusers":     lambda: handle_allusers(chat_id),
         "/missing":      lambda: handle_missing(chat_id),
+        "/ydebug":       lambda: handle_yahoo_debug(chat_id, args),
         # ── admin (short) ─────────────────────────────────────
         "/a":            lambda: handle_admin_cmd(chat_id),
         "/t":            lambda: handle_threshold_cmd(chat_id, args),
