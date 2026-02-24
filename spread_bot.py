@@ -336,6 +336,9 @@ tracked_prices: dict[int, dict[str, float]] = {}
 # /change override: None = auto-detect from Yahoo marketState
 # Values: "auto" | "regular" | "pre" | "post"
 price_mode_override: str = "auto"
+
+# /onlyadmin mode — alerts go only to admin, not all subscribers
+admin_only_mode: bool = False
 mexc_cache:        dict[str, MexcSnapshot]  = {}
 spread_cache:      dict[str, SpreadRecord]  = {}
 peak_spread:       dict[str, float]         = {}
@@ -463,6 +466,11 @@ def broadcast(text: str, keyboard: Optional[dict] = None) -> None:
     dead = []
     with subscribers_lock:
         targets = list(subscribers.keys())
+    # When admin-only mode is on, send only to admin
+    if admin_only_mode:
+        targets = [t for t in targets if t == ADMIN_ID]
+        if not targets and ADMIN_ID:
+            targets = [ADMIN_ID]
     for chat_id in targets:
         try:
             resp = requests.post(
@@ -592,17 +600,17 @@ def _parse_quote(q: dict) -> Optional[YahooSnapshot]:
     """
     Parse one Yahoo quote dict into YahooSnapshot.
 
-    Uses Yahoo's explicit `marketState` field to determine which price to use:
-      PRE    → preMarketPrice   (pre-market session active)
-      POST   → postMarketPrice  (after-hours session active)
-      REGULAR→ regularMarketPrice (market open)
-      CLOSED → regularMarketPrice (market closed, no extended hours trading)
+    Yahoo's `marketState` is UNRELIABLE — it sometimes returns "REGULAR"
+    during overnight/pre-market hours. We use timestamps instead:
 
-    This avoids the stale price bug where postMarketPrice from a previous
-    session gets used even though the market has since opened and closed again.
+      postMarketTime  > regularMarketTime  → after-hours price is fresh → use it
+      preMarketTime   > regularMarketTime  → pre-market price is fresh  → use it
+      otherwise                            → use regularMarketPrice
+
+    Manual /change override always takes priority over auto-detection.
     """
-    ticker       = q.get("symbol", "")
-    market_state = (q.get("marketState") or "").upper()  # PRE, REGULAR, POST, CLOSED, PREPRE, POSTPOST
+    ticker        = q.get("symbol", "")
+    market_state  = (q.get("marketState") or "").upper()
 
     regular_price: Optional[float] = None
     pre_price:     Optional[float] = None
@@ -632,18 +640,26 @@ def _parse_quote(q: dict) -> Optional[YahooSnapshot]:
     if not regular_price:
         return None
 
+    # Extract timestamps (Unix seconds). Yahoo returns these as integers.
+    regular_time = int(q.get("regularMarketTime") or 0)
+    pre_time     = int(q.get("preMarketTime")     or 0)
+    post_time    = int(q.get("postMarketTime")    or 0)
+
+    # post/pre are "fresh" if their timestamp is AFTER the regular market close
+    post_is_fresh = post_time > regular_time and post_price is not None
+    pre_is_fresh  = pre_time  > regular_time and pre_price  is not None
+
     logger.info(
-        "Yahoo raw %-6s | marketState=%s  regular=%.4f  pre=%s  post=%s  mode=%s",
-        ticker, market_state, regular_price or 0,
+        "Yahoo %-6s | state=%-8s regular=%.4f pre=%s(%s) post=%s(%s) mode=%s",
+        ticker, market_state, regular_price,
         f"{pre_price:.4f}"  if pre_price  else "none",
+        "FRESH" if pre_is_fresh  else "stale",
         f"{post_price:.4f}" if post_price else "none",
+        "FRESH" if post_is_fresh else "stale",
         price_mode_override,
     )
 
-    # Price selection:
-    # If admin used /change to set an explicit mode → honour it unconditionally.
-    # Otherwise use Yahoo marketState as authoritative source.
-    mode = price_mode_override  # snapshot to avoid race
+    mode = price_mode_override
 
     if mode == "pre":
         active_state = MARKET_PRE
@@ -655,10 +671,16 @@ def _parse_quote(q: dict) -> Optional[YahooSnapshot]:
         active_state = MARKET_REGULAR
         active_price = regular_price
     else:
-        # auto — trust Yahoo marketState field
-        if market_state in ("PRE", "PREPRE") and pre_price:
+        # auto — timestamps are authoritative, marketState is just a hint
+        if pre_is_fresh:
+            active_state, active_price = MARKET_PRE,     pre_price
+        elif post_is_fresh:
+            active_state, active_price = MARKET_AFTER,   post_price
+        elif market_state in ("PRE", "PREPRE") and pre_price:
+            # timestamps unavailable but marketState says pre — trust it
             active_state, active_price = MARKET_PRE,     pre_price
         elif market_state in ("POST", "POSTPOST", "CLOSED") and post_price:
+            # timestamps unavailable but marketState says post — trust it
             active_state, active_price = MARKET_AFTER,   post_price
         else:
             active_state, active_price = MARKET_REGULAR, regular_price
@@ -1254,7 +1276,8 @@ def handle_status(chat_id: int) -> None:
     with subscribers_lock:
         sub_count = len(subscribers)
     mute_text    = f"\n🔇 Muted: <b>{mute_remaining()}</b>" if is_muted() else ""
-    muteall_text = "\n🔕 MuteAll: <b>ON</b>" if muteall_active else ""
+    muteall_text   = "\n🔕 MuteAll: <b>ON</b>" if muteall_active else ""
+    admin_only_text = "\n🔒 <b>Admin-only mode ON</b> — subscribers not receiving alerts" if admin_only_mode else ""
     tg_send(
         chat_id,
         f"📊 <b>Bot Status</b>\n\n"
@@ -1270,7 +1293,7 @@ def handle_status(chat_id: int) -> None:
         f"📶 Threshold:  <b>±{global_threshold}%</b>  |  Step: <b>{alert_step}%</b>\n"
         f"🔄 Interval:   <b>{FETCH_INTERVAL}s</b>\n"
         f"👥 Subscribers: <b>{sub_count}</b>"
-        f"{muteall_text}{mute_text}"
+        f"{muteall_text}{mute_text}{admin_only_text}"
     )
 
 
@@ -1297,6 +1320,8 @@ def handle_help(chat_id: int) -> None:
             "/test    — send test alert\n"
             "/missing — symbols with no data\n"
             "/restart — restart the bot process\n"
+            "/onlyadmin — alerts only to you\n"
+            "/allusers  — alerts to all subscribers\n"
             "/say Hello everyone! — broadcast to all subscribers\n"
             "/change — show/set price mode (auto/pre/post/regular)\n"
         )
@@ -1813,11 +1838,39 @@ def notify_tracked_price_changes(yahoo_snaps: dict[str, "YahooSnapshot"]) -> Non
             )
 
 
-def handle_restart(chat_id: int) -> None:
+def handle_onlyadmin(chat_id: int) -> None:
+    global admin_only_mode
     if chat_id != ADMIN_ID:
         tg_send(chat_id, "⛔ Admin only.")
         return
-    tg_send(chat_id, "🔄 Restarting bot... reconnecting in a few seconds.")
+    admin_only_mode = True
+    tg_send(chat_id,
+        "🔒 <b>Admin-only mode ON</b>\n\n"
+        "Alerts will only be sent to you.\n"
+        "Subscribers won't receive anything until you run /allusers.")
+
+
+def handle_allusers(chat_id: int) -> None:
+    global admin_only_mode
+    if chat_id != ADMIN_ID:
+        tg_send(chat_id, "⛔ Admin only.")
+        return
+    admin_only_mode = False
+    tg_send(chat_id,
+        "🔓 <b>All-users mode ON</b>\n\n"
+        "Alerts are now going to all subscribers again.")
+
+
+def handle_restart(chat_id: int) -> None:
+    global admin_only_mode
+    if chat_id != ADMIN_ID:
+        tg_send(chat_id, "⛔ Admin only.")
+        return
+    admin_only_mode = True
+    tg_send(chat_id,
+        "🔄 Restarting bot...\n\n"
+        "🔒 Admin-only mode enabled automatically.\n"
+        "Run /allusers when you're happy everything is working.")
     logger.info("Manual restart triggered by admin (chat_id=%d)", chat_id)
     time.sleep(1)
     os.execv(sys.executable, [sys.executable] + sys.argv)
@@ -2028,6 +2081,8 @@ def dispatch(update: dict) -> None:
         "/change":       lambda: handle_change(chat_id, args),
         "/test":         lambda: handle_test(chat_id),
         "/restart":      lambda: handle_restart(chat_id),
+        "/onlyadmin":    lambda: handle_onlyadmin(chat_id),
+        "/allusers":     lambda: handle_allusers(chat_id),
         "/missing":      lambda: handle_missing(chat_id),
         # ── admin (short) ─────────────────────────────────────
         "/a":            lambda: handle_admin_cmd(chat_id),
