@@ -599,8 +599,8 @@ def _yahoo_quote_batch(tickers: list[str]) -> list[dict]:
 def _yahoo_chart_price(ticker: str) -> Optional[tuple[float, int]]:
     """
     Fetch the most recent price from Yahoo's chart API (v8/finance/chart).
-    This returns the last traded price including overnight/PREPRE session data
-    that the v7 quote API does NOT include.
+    Uses period1/period2 to fetch the last 12 hours of 1-minute candles,
+    which captures overnight/PREPRE session data not in v7 quote API.
 
     Returns (price, timestamp) or None on failure.
     """
@@ -609,12 +609,16 @@ def _yahoo_chart_price(ticker: str) -> Optional[tuple[float, int]]:
             **_BROWSER_HEADERS,
             "Cookie": _yahoo_cookie or "",
         }
+        now     = int(time.time())
+        period1 = now - 12 * 3600  # last 12 hours
+
         resp = _yahoo_session.get(
             f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
             params={
                 "interval":       "1m",
-                "range":          "1d",
-                "includePrePost": "true",   # include pre/post/overnight candles
+                "period1":        str(period1),
+                "period2":        str(now),
+                "includePrePost": "true",
             },
             headers=headers,
             timeout=10,
