@@ -690,12 +690,10 @@ def _parse_quote(q: dict) -> Optional[YahooSnapshot]:
     post_is_fresh = post_time > regular_time and post_price is not None
     pre_is_fresh  = pre_time  > regular_time and pre_price  is not None
 
-    # Chart price — fetched for PREPRE/overnight when v7 has no live price
+    # Chart price — always fetch for PREPRE/POSTPOST (overnight), or when no fresh price exists
     chart_price:  Optional[float] = None
     chart_time:   int             = 0
-    if market_state in ("PREPRE", "POSTPOST") or (
-        not post_is_fresh and not pre_is_fresh and market_state not in ("REGULAR",)
-    ):
+    if market_state in ("PREPRE", "POSTPOST") or not (post_is_fresh or pre_is_fresh):
         chart_result = _yahoo_chart_price(ticker)
         if chart_result:
             chart_price, chart_time = chart_result
@@ -727,13 +725,17 @@ def _parse_quote(q: dict) -> Optional[YahooSnapshot]:
         active_state = MARKET_REGULAR
         active_price = regular_price
     else:
-        # auto — timestamps + chart API are authoritative
-        if pre_is_fresh:
+        # auto — for PREPRE/overnight, chart API has the freshest price
+        # post_is_fresh only means "newer than regular close" — but during
+        # PREPRE, postMarketPrice stopped updating hours ago and chart has newer data
+        if chart_price and chart_time > post_time and chart_time > pre_time:
+            # Chart candle is the most recent price — use it regardless of state
+            active_state, active_price = MARKET_AFTER,   chart_price
+        elif pre_is_fresh:
             active_state, active_price = MARKET_PRE,     pre_price
         elif post_is_fresh:
             active_state, active_price = MARKET_AFTER,   post_price
         elif chart_price:
-            # Overnight / PREPRE — use chart candle (the real current price)
             active_state, active_price = MARKET_AFTER,   chart_price
         elif market_state in ("PRE", "PREPRE") and pre_price:
             active_state, active_price = MARKET_PRE,     pre_price
