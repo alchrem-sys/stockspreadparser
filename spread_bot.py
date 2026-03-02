@@ -596,65 +596,10 @@ def _yahoo_quote_batch(tickers: list[str]) -> list[dict]:
     return data.get("quoteResponse", {}).get("result", [])
 
 
-def _yahoo_chart_price(ticker: str) -> Optional[tuple[float, int]]:
-    """
-    Fetch the most recent price from Yahoo's chart API (v8/finance/chart).
-    Uses period1/period2 to fetch the last 12 hours of 1-minute candles,
-    which captures overnight/PREPRE session data not in v7 quote API.
-
-    Returns (price, timestamp) or None on failure.
-    """
-    try:
-        headers = {
-            **_BROWSER_HEADERS,
-            "Cookie": _yahoo_cookie or "",
-        }
-        now     = int(time.time())
-        period1 = now - 12 * 3600  # last 12 hours
-
-        resp = _yahoo_session.get(
-            f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
-            params={
-                "interval":       "1m",
-                "period1":        str(period1),
-                "period2":        str(now),
-                "includePrePost": "true",
-            },
-            headers=headers,
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            return None
-        data   = resp.json()
-        result = data.get("chart", {}).get("result", [])
-        if not result:
-            return None
-        r          = result[0]
-        timestamps = r.get("timestamp", [])
-        closes     = r.get("indicators", {}).get("quote", [{}])[0].get("close", [])
-        # Walk backwards to find last non-null close
-        for ts, close in zip(reversed(timestamps), reversed(closes)):
-            if close is not None and close > 0:
-                return float(close), int(ts)
-        return None
-    except Exception as exc:
-        logger.debug("Chart API error for %s: %s", ticker, exc)
-        return None
-
-
 def _parse_quote(q: dict) -> Optional[YahooSnapshot]:
     """
     Parse one Yahoo quote dict into YahooSnapshot.
-
-    Yahoo's v7 API has these known limitations:
-      - marketState is unreliable (returns REGULAR during overnight hours)
-      - postMarketPrice only covers 4PM-8PM EST after-hours session
-      - PREPRE state (8PM-4AM EST overnight) has NO price in v7 API
-
-    Solution:
-      1. Use timestamps to check if pre/post prices are fresh
-      2. For PREPRE state, fall back to chart API (v8) which includes overnight candles
-      3. Manual /change override always wins
+    Uses timestamps to check if pre/post prices are fresh vs regular close.
     """
     ticker        = q.get("symbol", "")
     market_state  = (q.get("marketState") or "").upper()
@@ -687,33 +632,20 @@ def _parse_quote(q: dict) -> Optional[YahooSnapshot]:
     if not regular_price:
         return None
 
-    regular_time = int(q.get("regularMarketTime") or 0)
-    pre_time     = int(q.get("preMarketTime")     or 0)
-    post_time    = int(q.get("postMarketTime")    or 0)
+    regular_time  = int(q.get("regularMarketTime") or 0)
+    pre_time      = int(q.get("preMarketTime")     or 0)
+    post_time     = int(q.get("postMarketTime")    or 0)
 
     post_is_fresh = post_time > regular_time and post_price is not None
     pre_is_fresh  = pre_time  > regular_time and pre_price  is not None
 
-    # Chart price — always fetch for PREPRE/POSTPOST (overnight), or when no fresh price exists
-    chart_price:  Optional[float] = None
-    chart_time:   int             = 0
-    if market_state in ("PREPRE", "POSTPOST") or not (post_is_fresh or pre_is_fresh):
-        chart_result = _yahoo_chart_price(ticker)
-        if chart_result:
-            chart_price, chart_time = chart_result
-            # Only use chart price if it's newer than regular close
-            if chart_time <= regular_time:
-                chart_price = None
-                chart_time  = 0
-
     logger.info(
-        "Yahoo %-6s | state=%-8s regular=%.4f pre=%s(%s) post=%s(%s) chart=%s mode=%s",
+        "Yahoo %-6s | state=%-8s regular=%.4f pre=%s(%s) post=%s(%s) mode=%s",
         ticker, market_state, regular_price,
-        f"{pre_price:.4f}"    if pre_price    else "none",
+        f"{pre_price:.4f}"  if pre_price  else "none",
         "FRESH" if pre_is_fresh  else "stale",
-        f"{post_price:.4f}"   if post_price   else "none",
+        f"{post_price:.4f}" if post_price else "none",
         "FRESH" if post_is_fresh else "stale",
-        f"{chart_price:.4f}"  if chart_price  else "none",
         price_mode_override,
     )
 
@@ -729,18 +661,10 @@ def _parse_quote(q: dict) -> Optional[YahooSnapshot]:
         active_state = MARKET_REGULAR
         active_price = regular_price
     else:
-        # auto — for PREPRE/overnight, chart API has the freshest price
-        # post_is_fresh only means "newer than regular close" — but during
-        # PREPRE, postMarketPrice stopped updating hours ago and chart has newer data
-        if chart_price and chart_time > post_time and chart_time > pre_time:
-            # Chart candle is the most recent price — use it regardless of state
-            active_state, active_price = MARKET_AFTER,   chart_price
-        elif pre_is_fresh:
+        if pre_is_fresh:
             active_state, active_price = MARKET_PRE,     pre_price
         elif post_is_fresh:
             active_state, active_price = MARKET_AFTER,   post_price
-        elif chart_price:
-            active_state, active_price = MARKET_AFTER,   chart_price
         elif market_state in ("PRE", "PREPRE") and pre_price:
             active_state, active_price = MARKET_PRE,     pre_price
         elif market_state in ("POST", "POSTPOST", "CLOSED") and post_price:
@@ -969,6 +893,14 @@ def send_spread_alert(
 
 
 def check_and_notify_state_changes(snapshots: dict[str, YahooSnapshot]) -> None:
+    """
+    Detect market state transitions and send ONE consolidated message
+    instead of one message per symbol.
+    Groups all symbols that changed to the same new state into a single alert.
+    """
+    # new_state → list of tickers that transitioned to it
+    transitions: dict[str, list[str]] = {}
+
     for ticker, snap in snapshots.items():
         prev = last_market_state.get(ticker)
         if prev is None:
@@ -977,28 +909,33 @@ def check_and_notify_state_changes(snapshots: dict[str, YahooSnapshot]) -> None:
         if prev != snap.active_state:
             logger.info("State change %s: %s → %s", ticker, prev, snap.active_state)
             last_market_state[ticker] = snap.active_state
+            transitions.setdefault(snap.active_state, []).append(ticker)
 
-            if snap.active_state == MARKET_PRE:
-                icon  = "🌅"
-                label = "Pre-Market trading has begun"
-            elif snap.active_state == MARKET_AFTER:
-                icon  = "🌙"
-                label = "After-Hours trading has begun"
-            elif snap.active_state == MARKET_REGULAR:
-                icon  = "🔔"
-                label = "Regular Market is now open"
-            else:
-                icon  = "🔕"
-                label = "Market closed"
+    if not transitions:
+        return
 
-            msg = (
-                f"{icon} <b>Market State Changed: {ticker}</b>\n\n"
-                f"<b>{prev}</b> → <b>{snap.active_state}</b>\n"
-                f"{label}\n\n"
-                f"📌 Regular close: <code>${snap.regular_price:.4f}</code>\n"
-                f"📡 Now tracking:  <code>${snap.active_price:.4f}</code>"
-            )
-            threading.Thread(target=broadcast, args=(msg,), daemon=True).start()
+    # Send one message per new state (almost always just one transition at a time)
+    for new_state, tickers in transitions.items():
+        if new_state == MARKET_PRE:
+            icon  = "🌅"
+            label = "Pre-Market trading has begun"
+        elif new_state == MARKET_AFTER:
+            icon  = "🌙"
+            label = "After-Hours trading has begun"
+        elif new_state == MARKET_REGULAR:
+            icon  = "🔔"
+            label = "Regular Market is now open"
+        else:
+            icon  = "🔕"
+            label = "Market closed"
+
+        msg = (
+            f"{icon} <b>Market State Changed</b>\n\n"
+            f"<b>{label}</b>\n"
+            f"Now tracking: <b>{new_state}</b>\n\n"
+            f"Use /change if prices look wrong."
+        )
+        threading.Thread(target=broadcast, args=(msg,), daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -2004,9 +1941,9 @@ def handle_yahoo_debug(chat_id: int, args: list[str]) -> None:
         pre_fresh     = int(pre_time  or 0) > regular_fresh
         post_fresh    = int(post_time or 0) > regular_fresh
 
-        chart_result  = _yahoo_chart_price(yahoo_ticker)
-        chart_price   = chart_result[0] if chart_result else None
-        chart_ts      = chart_result[1] if chart_result else None
+        chart_result  = None
+        chart_price   = None
+        chart_ts      = None
 
         tg_send(chat_id,
             f"📡 <b>Raw Yahoo API: {display} ({yahoo_ticker})</b>\n\n"
@@ -2019,9 +1956,7 @@ def handle_yahoo_debug(chat_id: int, args: list[str]) -> None:
             f"<b>postMarketPrice:</b>    <code>${post_price}</code>\n"
             f"<b>postMarketTime:</b>     <code>{fmt_ts(post_time)}</code>\n"
             f"<b>post is FRESH:</b>      <code>{post_fresh}</code>\n\n"
-            f"<b>Chart API price:</b>    <code>${chart_price}</code>\n"
-            f"<b>Chart API time:</b>     <code>{fmt_ts(chart_ts)}</code>\n\n"
-            f"<b>→ Bot would use:</b>    <code>${chart_price if (chart_price and not pre_fresh and not post_fresh) else (pre_price if pre_fresh else (post_price if post_fresh else regular_price))}</code>"
+            f"<b>→ Bot would use:</b>    <code>${pre_price if pre_fresh else (post_price if post_fresh else regular_price)}</code>"
         )
 
     except Exception as exc:
