@@ -14,6 +14,7 @@ import logging
 import os
 import sys
 import threading
+import concurrent.futures
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -347,6 +348,8 @@ last_market_state: dict[str, str]           = {}
 state_lock = threading.Lock()
 
 muted_until:        float    = 0.0
+schedule_muted:     bool     = False   # True when outside trading hours (09:00–14:30 UTC)
+manual_unmute:      bool     = False   # /unmute overrides schedule until next window
 muteall_active:     bool     = False
 muteall_exceptions: set[str] = set()
 
@@ -364,7 +367,11 @@ subscribers_lock = threading.Lock()
 
 
 def is_muted() -> bool:
-    return time.time() < muted_until
+    if time.time() < muted_until:
+        return True
+    if schedule_muted and not manual_unmute:
+        return True
+    return False
 
 
 def mute_remaining() -> str:
@@ -1480,16 +1487,19 @@ def handle_mute(chat_id: int, args: list[str]) -> None:
 
 
 def handle_unmute(chat_id: int) -> None:
-    global muted_until
+    global muted_until, manual_unmute
     if chat_id != ADMIN_ID:
         tg_send(chat_id, "⛔ Admin only.")
         return
-    if not is_muted():
-        tg_send(chat_id, "ℹ️ Not muted.")
-        return
-    muted_until = 0.0
+    muted_until   = 0.0
+    manual_unmute = True
     db_save_all_settings()
-    tg_send(chat_id, "🔊 <b>Alerts restored!</b>")
+    if schedule_muted:
+        tg_send(chat_id,
+            "🔊 <b>Alerts restored!</b>\n"
+            "⚠️ Outside trading hours — schedule override active until 09:00 UTC.")
+    else:
+        tg_send(chat_id, "🔊 <b>Alerts restored!</b>")
 
 
 def handle_muteall(chat_id: int, args: list[str]) -> None:
@@ -2197,6 +2207,42 @@ def polling_thread() -> None:
 # ---------------------------------------------------------------------------
 
 
+def schedule_thread() -> None:
+    """
+    Mutes alerts outside trading hours Mon–Fri.
+    Active window: 09:00–14:30 UTC
+    Outside window: auto-muted (overrideable with /unmute)
+    """
+    global schedule_muted, manual_unmute
+    logger.info("Schedule thread started — active 09:00–14:30 UTC weekdays")
+    while True:
+        try:
+            import datetime
+            now     = datetime.datetime.utcnow()
+            weekday = now.weekday()       # 0=Mon … 4=Fri
+            in_window = (
+                weekday < 5 and
+                (now.hour > 9 or (now.hour == 9 and now.minute >= 0)) and
+                (now.hour < 14 or (now.hour == 14 and now.minute < 30))
+            )
+            if in_window:
+                if schedule_muted:
+                    # Window just opened — reset manual override too
+                    schedule_muted = False
+                    manual_unmute  = False
+                    logger.info("Schedule: trading window opened, alerts active")
+                    broadcast("📈 <b>Trading hours started</b> — alerts active (09:00–14:30 UTC)")
+            else:
+                if not schedule_muted:
+                    schedule_muted = True
+                    manual_unmute  = False
+                    logger.info("Schedule: outside trading hours, alerts muted")
+                    broadcast("🔕 <b>Outside trading hours</b> — alerts muted until 09:00 UTC\nUse /unmute to override.")
+        except Exception as exc:
+            logger.error("Schedule thread error: %s", exc)
+        time.sleep(30)
+
+
 def monitoring_loop() -> None:
     logger.info(
         "Monitor v6.0 started — interval=%ds threshold=%.2f%% step=%.2f%%",
@@ -2206,8 +2252,11 @@ def monitoring_loop() -> None:
         cycle_start = time.time()
         logger.info("Fetching prices...")
 
-        mexc_data   = fetch_mexc_data()
-        yahoo_snaps = fetch_all_yahoo()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            fut_mexc  = pool.submit(fetch_mexc_data)
+            fut_yahoo = pool.submit(fetch_all_yahoo)
+            mexc_data   = fut_mexc.result()
+            yahoo_snaps = fut_yahoo.result()
 
         with state_lock:
             mexc_cache.update(mexc_data)
@@ -2365,5 +2414,6 @@ if __name__ == "__main__":
         "Spread bot v7.0 — threshold=%.1f%% step=%.1f%% interval=%ds subs=%d",
         global_threshold, alert_step, FETCH_INTERVAL, len(subscribers),
     )
-    threading.Thread(target=polling_thread, daemon=True).start()
+    threading.Thread(target=polling_thread,  daemon=True).start()
+    threading.Thread(target=schedule_thread, daemon=True).start()
     monitoring_loop()
