@@ -348,7 +348,7 @@ last_market_state: dict[str, str]           = {}
 state_lock = threading.Lock()
 
 muted_until:        float    = 0.0
-schedule_muted:     bool     = False   # True when outside trading hours (09:00–14:30 UTC)
+schedule_muted:     bool     = False   # True when outside trading hours (08:00–13:30 UTC)
 manual_unmute:      bool     = False   # /unmute overrides schedule until next window
 muteall_active:     bool     = False
 muteall_exceptions: set[str] = set()
@@ -1497,7 +1497,7 @@ def handle_unmute(chat_id: int) -> None:
     if schedule_muted:
         tg_send(chat_id,
             "🔊 <b>Alerts restored!</b>\n"
-            "⚠️ Outside trading hours — schedule override active until 09:00 UTC.")
+            "⚠️ Outside trading hours — schedule override active until 08:00 UTC.")
     else:
         tg_send(chat_id, "🔊 <b>Alerts restored!</b>")
 
@@ -2210,11 +2210,11 @@ def polling_thread() -> None:
 def schedule_thread() -> None:
     """
     Mutes alerts outside trading hours Mon–Fri.
-    Active window: 09:00–14:30 UTC
+    Active window: 08:00–13:30 UTC
     Outside window: auto-muted (overrideable with /unmute)
     """
     global schedule_muted, manual_unmute
-    logger.info("Schedule thread started — active 09:00–14:30 UTC weekdays")
+    logger.info("Schedule thread started — active 08:00–13:30 UTC weekdays")
     while True:
         try:
             import datetime
@@ -2222,8 +2222,8 @@ def schedule_thread() -> None:
             weekday = now.weekday()       # 0=Mon … 4=Fri
             in_window = (
                 weekday < 5 and
-                (now.hour > 9 or (now.hour == 9 and now.minute >= 0)) and
-                (now.hour < 14 or (now.hour == 14 and now.minute < 30))
+                (now.hour > 8 or (now.hour == 8 and now.minute >= 0)) and
+                (now.hour < 13 or (now.hour == 13 and now.minute < 30))
             )
             if in_window:
                 if schedule_muted:
@@ -2231,13 +2231,13 @@ def schedule_thread() -> None:
                     schedule_muted = False
                     manual_unmute  = False
                     logger.info("Schedule: trading window opened, alerts active")
-                    broadcast("📈 <b>Trading hours started</b> — alerts active (09:00–14:30 UTC)")
+                    broadcast("📈 <b>Trading hours started</b> — alerts active (08:00–13:30 UTC)")
             else:
                 if not schedule_muted:
                     schedule_muted = True
                     manual_unmute  = False
                     logger.info("Schedule: outside trading hours, alerts muted")
-                    broadcast("🔕 <b>Outside trading hours</b> — alerts muted until 09:00 UTC\nUse /unmute to override.")
+                    broadcast("🔕 <b>Outside trading hours</b> — alerts muted until 08:00 UTC\nUse /unmute to override.")
         except Exception as exc:
             logger.error("Schedule thread error: %s", exc)
         time.sleep(30)
